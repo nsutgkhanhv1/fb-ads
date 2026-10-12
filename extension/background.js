@@ -19,7 +19,6 @@ console.log("[AMIT V1] Background Service Worker loaded");
 // Cấu hình Declarative Net Request để lách CORS Facebook
 chrome.runtime.onInstalled.addListener(details => {
   AmitLog.info("sw.onInstalled", { reason: details && details.reason, previous: details && details.previousVersion });
-  setupDnrRules();
   injectIntoExistingFacebookTabs();
   resolveFacebookSession(true);
   setupAutoSyncAlarm();
@@ -44,8 +43,8 @@ chrome.alarms.onAlarm.addListener(alarm => {
   }
 });
 
-function setupDnrRules() {
-  chrome.declarativeNetRequest.updateDynamicRules({
+async function setupDnrRules() {
+  await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: [1],
     addRules: [{
       id: 1,
@@ -67,9 +66,19 @@ function setupDnrRules() {
       }
     }]
   });
-  AmitLog.info("sw.dnr.configured", {});
+  // Ghi lại luật đang có hiệu lực để log gửi dev chứng minh luật cũ (áp cho MỌI XHR facebook.com) đã bị thay.
+  try {
+    const rules = await chrome.declarativeNetRequest.getDynamicRules();
+    AmitLog.info("sw.dnr.configured", { rules: rules.map(r => ({ id: r.id, initiatorDomains: r.condition.initiatorDomains || null, urlFilter: r.condition.urlFilter })) });
+  } catch (e) {
+    AmitLog.info("sw.dnr.configured", {});
+  }
   console.log("[AMIT V1] DNR Header Rewrite Rules configured");
 }
+
+// Chạy mỗi lần service worker nạp (không chỉ lúc cài đặt): máy khách đã cài bản cũ có thể còn luật cũ
+// (đổi Origin của MỌI XHR facebook.com -> Facebook báo "unknown error (empty response)"); lệnh này ghi đè luật id=1.
+setupDnrRules().catch(e => AmitLog.warn("sw.dnr.failed", { error: e }));
 
 /**
  * Tự động inject script vào tất cả các tab Facebook đã mở sẵn
