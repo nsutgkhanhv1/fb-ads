@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <title>AMIT V1 Popup</title>
+  <style>
+    body {
+      width: 320px;
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 13px;
+      color: #171717;
+      background: #f9f9f9;
+    }
+    .header {
+      background: #202020;
+      color: #fff;
+      padding: 14px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .brand {
+      font-size: 15px;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+    }
+    .badge {
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 10px;
+      background: #3b3b3b;
+      color: #00e676;
+    }
+    .body {
+      padding: 14px 16px;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }
+    .row span:first-child {
+      color: #707070;
+    }
+    .row b {
+      font-weight: 600;
+    }
+    .btn {
+      width: 100%;
+      padding: 10px;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      background: #fff;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 6px;
+      transition: background 0.15s;
+    }
+    .btn:hover {
+      background: #eee;
+    }
+    .btn.primary {
+      background: #171717;
+      color: #fff;
+      border-color: #171717;
+    }
+    .btn.primary:hover {
+      background: #333;
+    }
+    .status-msg {
+      margin-top: 10px;
+      font-size: 12px;
+      color: #555;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="brand">AMIT V1</div>
+    <div class="badge" id="statusBadge">Active</div>
+  </div>
+  <div class="body">
+    <div class="card">
+      <div class="row"><span>Via đang hoạt động:</span><b id="viaUid">—</b></div>
+      <div class="row"><span>Tên Via:</span><b id="viaName">—</b></div>
+      <div class="row"><span>Token Ads:</span><b id="tokenStatus">Chưa có</b></div>
+    </div>
+
+    <!-- Danh sách các Via đã từng kết nối -->
+    <div class="card" id="savedViasCard" style="display:none;">
+      <div style="font-weight:700;font-size:11px;color:#707070;margin-bottom:8px;text-transform:uppercase;">
+        Các Via đã kết nối (<span id="savedViasCount">0</span>)
+      </div>
+      <div id="savedViasList" style="max-height:130px;overflow-y:auto;"></div>
+    </div>
+
+    <!-- Jev (OpenRouter): NƠI DUY NHẤT để đặt API key -->
+    <div class="card" id="jevCard">
+      <div style="font-weight:700;font-size:11px;color:#707070;margin-bottom:8px;text-transform:uppercase;">
+        Jev (OpenRouter)
+      </div>
+      <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
+        <input type="checkbox" id="jevEnabled"> Bật Jev (hỗ trợ tìm control khi UI Facebook đổi)
+      </label>
+      <label style="display:block;color:#707070;font-size:11px;margin-bottom:2px;">OpenRouter API key</label>
+      <input type="password" id="jevKey" autocomplete="off" spellcheck="false" placeholder="sk-or-…"
+        style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:6px;margin-bottom:6px;">
+      <label style="display:block;color:#707070;font-size:11px;margin-bottom:2px;">Model</label>
+      <input type="text" id="jevModel" autocomplete="off" spellcheck="false"
+        style="width:100%;box-sizing:border-box;padding:6px;border:1px solid #ccc;border-radius:6px;">
+      <div style="display:flex;gap:6px;">
+        <button class="btn primary" id="jevSave" style="margin-top:8px;">Lưu</button>
+        <button class="btn" id="jevTest" style="margin-top:8px;">Kiểm tra</button>
+      </div>
+      <button class="btn" id="jevClear" style="margin-top:6px;font-weight:400;color:#c62828;">Xóa key</button>
+      <div class="status-msg" id="jevMsg" style="margin-top:8px;">Chỉ gửi tên các nút trên màn hình (đã che dãy số dài). Không gửi token, cookie hay HTML.</div>
+    </div>
+
+    <button class="btn primary" id="openWebApp">MỞ AMIT WORKSPACE</button>
+    <button class="btn" id="discoveryBtn">QUÉT LẠI TKQC (DISCOVERY)</button>
+    <button class="btn" id="openLogs">LOG &amp; BÁO LỖI (GỬI CHO DEV)</button>
+
+    <div class="status-msg" id="statusMsg">Đang kiểm tra session Facebook…</div>
+  </div>
+
+  <script src="../../shared/logger.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

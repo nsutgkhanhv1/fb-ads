@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AMIT V1 — Web/CMS Workspace</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="app">
+    <!-- Sidebar Menu Trái CMS -->
+    <aside class="side">
+      <div class="brand">
+        <span>AMIT V1</span>
+        <span class="brand-badge">CMS</span>
+      </div>
+      <button class="nav active" data-screen="ads">
+        <span>▦</span>
+        <span>Ads Check</span>
+      </button>
+      <button class="nav" data-screen="super">
+        <span>⇄</span>
+        <span>Super Share</span>
+      </button>
+      <button class="nav" id="openLogs" type="button" title="Xuất file log để gửi cho người phát triển khi gặp lỗi">
+        <span>🐞</span>
+        <span>Log &amp; báo lỗi</span>
+      </button>
+
+      <div class="side-footer">
+        <b>Local-First Workspace</b><br>
+        TKQC là đơn vị dữ liệu chính.<br>
+        3 Cột cố định: Checkbox, Via, ID TKQC.
+      </div>
+    </aside>
+
+    <!-- Khu Vực Nội Dung Chính -->
+    <main class="main">
+      
+      <!-- SCREEN 1: ADS CHECK -->
+      <section id="ads" class="screen active">
+        <div class="top">
+          <div>
+            <div class="title">Ads Check</div>
+            <div class="sub">Dataset tài khoản quảng cáo hiện tại</div>
+          </div>
+          <div class="badge badge-active">Auto Sync: Bật</div>
+        </div>
+
+        <div class="toolbar">
+          <input id="adsSearch" class="field search" placeholder="Tìm TKQC / Via / BM / Trạng thái…">
+          <button class="btn" id="filterBtn">Bộ lọc</button>
+          <button class="btn" id="syncBtn">↻ Sync</button>
+          <select class="field" id="currency">
+            <option>Currency: MIX</option>
+            <option>Currency: VND</option>
+            <option>Currency: USD</option>
+          </select>
+          <select class="field" id="zoom">
+            <option>Scale 100%</option>
+            <option>Scale 90%</option>
+            <option>Scale 80%</option>
+          </select>
+          <button class="btn" id="columnsBtn">Cột hiển thị</button>
+          <button class="btn btn-danger" id="deleteSelectedBtn" style="display:none">🗑 Xóa đã chọn (<span id="delCount">0</span>)</button>
+          <span class="spacer"></span>
+          <span class="badge" id="adsCount">Đang tải…</span>
+        </div>
+
+        <div id="adsTable" class="table-wrap"></div>
+
+        <div class="pagination">
+          <span>Hiển thị mỗi trang:</span>
+          <select class="field" style="height:30px">
+            <option>50</option>
+            <option>100</option>
+            <option>200</option>
+          </select>
+          <span class="spacer"></span>
+          <button class="btn">‹</button>
+          <span>Trang 1 / 1</span>
+          <button class="btn">›</button>
+        </div>
+      </section>
+
+      <!-- SCREEN 2: SUPER SHARE -->
+      <section id="super" class="screen">
+        
+        <!-- MÀN CHỌN NGUỒN (SOURCE SELECTION) -->
+        <div id="sourceView" class="source">
+          <div class="card">
+            <div class="title">Super Share</div>
+            <p class="sub">Chọn nguồn TKQC để bắt đầu phiên làm việc Workspace.</p>
+            
+            <div class="radio-row selected">
+              <label>
+                <input type="radio" name="src" value="all" checked>
+                Tải tất cả TKQC
+              </label>
+              <div class="hint" style="margin-left: 22px;">Tải toàn bộ tài khoản quảng cáo hiện khả dụng trong hệ thống.</div>
+            </div>
+
+            <div class="radio-row">
+              <label>
+                <input type="radio" name="src" value="ads">
+                Tải các TKQC đã chọn ở Ads Check
+              </label>
+              <div id="adsSelHint" class="hint" style="margin-left: 22px;">Chưa chọn TKQC nào ở Ads Check.</div>
+            </div>
+
+            <div class="radio-row">
+              <label>
+                <input type="radio" name="src" value="ids">
+                Tải theo danh sách ID TKQC
+              </label>
+              <div id="idArea" class="hidden" style="margin-top: 10px;">
+                <textarea id="idInput" class="textarea" placeholder="Nhập mỗi dòng một ID TKQC&#10;Ví dụ:&#10;1288013719961305&#10;238801234567890"></textarea>
+                <div id="idErr" class="error-banner hidden"></div>
+              </div>
+            </div>
+
+            <button id="loadBtn" class="btn primary" style="width:100%;margin-top:14px;height:40px">TẢI NGAY</button>
+            <div id="loadMsg" class="hint" style="margin-top:10px;text-align:center;"></div>
+          </div>
+        </div>
+
+        <!-- MÀN WORKSPACE (BẢNG + PANEL PHẢI) -->
+        <div id="workspace" class="screen">
+          <div class="top">
+            <div>
+              <div class="title">Super Share</div>
+              <div class="sub">Workspace thao tác chia sẻ và phân quyền hàng loạt</div>
+            </div>
+            <button class="btn" id="changeSource">⇄ Đổi nguồn</button>
+          </div>
+
+          <div class="ss-layout">
+            <!-- Bảng giữa -->
+            <div class="ss-center">
+              <div class="toolbar">
+                <button class="btn" id="ssFilter">Bộ lọc / Sort</button>
+                <button class="btn btn-danger" id="ssDeleteSelectedBtn" style="display:none">🗑 Xóa khỏi Workspace</button>
+                <span id="selectedTop" class="badge">Đã chọn: 0 TKQC</span>
+                <span class="spacer"></span>
+                <span class="hint" style="margin:0">Selection được giữ nguyên khi sort / filter</span>
+              </div>
+
+              <div id="ssTable" class="table-wrap"></div>
+
+              <div class="pagination">
+                <span>Rows:</span>
+                <select class="field" style="height:30px">
+                  <option>50</option>
+                  <option>100</option>
+                  <option>200</option>
+                </select>
+                <span class="spacer"></span>
+                <span>Trang 1 / 1</span>
+              </div>
+            </div>
+
+            <!-- Panel Phải -->
+            <aside class="panel">
+              <div class="tabs">
+                <button class="tab active" data-tab="action">Hành động</button>
+                <button class="tab" data-tab="history">Lịch sử</button>
+              </div>
+
+              <!-- Tab Hành động -->
+              <div id="actionPanel" class="panel-body">
+                <div id="targetCount" class="target-badge">Đã chọn: 0 TKQC</div>
+                <div id="offlineWarning" class="error-banner hidden" style="margin:10px 0 0"></div>
+
+                <label class="label">Hành động</label>
+                <select id="actionSelect" class="control">
+                  <option value="">-- Chọn hành động --</option>
+                  <option value="SHARE_USER">1. Chia sẻ vai trò cho người dùng Facebook</option>
+                  <option value="REMOVE_BY_UID_EXCEPT_SELF">2. Xóa vai trò trên TKQC theo UID (trừ bạn)</option>
+                  <option value="REMOVE_ALL_EXCEPT_UIDS_AND_SELF">3. Xóa tất cả vai trò TKQC trừ UID giữ lại (trừ bạn)</option>
+                  <option value="REMOVE_ALL_EXCEPT_SELF">4. Xóa toàn bộ vai trò trên TKQC (trừ bạn)</option>
+                  <option value="REMOVE_SELF">5. Xóa chính mình ra khỏi TKQC</option>
+                </select>
+
+                <!-- Input động theo từng Action -->
+                <div id="dynamicFields"></div>
+
+                <label class="label">Delay giữa các TKQC</label>
+                <div class="delay">
+                  <input id="delay" class="control" type="number" min="3" max="10" step="1" value="3">
+                  <span>giây (3–10)</span>
+                </div>
+                <div id="delayErr" class="hint"></div>
+
+                <button id="execute" class="btn primary" style="width:100%;margin-top:16px;height:42px">THỰC HIỆN</button>
+                <div id="configHint" class="hint" style="margin-top:8px;text-align:center;">Chọn ít nhất 1 TKQC và nhập đủ thông tin để thực hiện.</div>
+
+                <!-- Tiến trình Execution khi đang chạy -->
+                <div id="progress" class="progress-box hidden">
+                  <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <strong id="execState">Đang thực hiện</strong>
+                  </div>
+                  
+                  <div class="bar"><i id="barFill"></i></div>
+                  
+                  <div class="stats-grid">
+                    <div class="stat-item" id="processed">Đã xử lý: 0 / 0</div>
+                    <div class="stat-item" id="okStat" style="color:#00875a;">Thành công: 0</div>
+                    <div class="stat-item" id="failStat" style="color:#de350b;">Thất bại: 0</div>
+                    <div class="stat-item" id="queueStat">Chờ: 0</div>
+                  </div>
+
+                  <!-- Tạm dừng do hệ thống (hết session / checkpoint): chỉ cho phép Tiếp tục -->
+                  <div id="resumeBox" class="hidden" style="margin-top:14px;padding-top:12px;border-top:1px dashed #ccc;">
+                    <div id="pauseMsg" class="hint" style="color:#b25e00"></div>
+                    <button class="btn primary" id="resumeBtn" style="width:100%;margin-top:8px">Tiếp tục</button>
+                  </div>
+
+                  <!-- Chi tiết TKQC / UID thất bại -->
+                  <div id="failedBox" class="hidden" style="margin-top:14px;padding-top:12px;border-top:1px dashed #ccc;">
+                    <label class="label" style="margin-top:0">Chi tiết thất bại</label>
+                    <div class="hint" style="margin-bottom:6px">Cần hỗ trợ? Mở "Log &amp; báo lỗi" ở thanh bên rồi gửi file log cho người phát triển.</div>
+                    <div id="failedList" style="max-height:220px;overflow-y:auto;font-size:12px;line-height:1.5"></div>
+                  </div>
+
+                  <!-- Hộp thoại Retry -->
+                  <div id="retryBox" class="hidden" style="margin-top:14px;padding-top:12px;border-top:1px dashed #ccc;">
+                    <label class="label" style="margin-top:0">Retry thất bại</label>
+                    <div class="hint">Chỉ chạy lại phần thất bại (đúng TKQC / UID lỗi), không chạy lại phần đã thành công.</div>
+                    <button class="btn primary" id="retryAll" style="width:100%;margin-top:8px">Retry tất cả thất bại</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Tab Lịch sử -->
+              <div id="historyPanel" class="panel-body hidden">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+                  <strong>Lịch sử Execution</strong>
+                  <button class="btn" id="exportBtn" style="height:28px;font-size:11px">Xuất CSV</button>
+                </div>
+                <div id="historyList"></div>
+              </div>
+            </aside>
+          </div>
+        </div>
+
+      </section>
+
+    </main>
+  </div>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="toast"></div>
+
+  <!-- Modal Dialog -->
+  <div id="modalBg" class="modal-bg">
+    <div class="modal">
+      <h3 id="modalTitle">Thông báo</h3>
+      <div id="modalBody"></div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px;">
+        <button class="btn" onclick="AmitApp.closeModal()">Hủy / Đóng</button>
+        <button class="btn primary" id="modalConfirmBtn" style="display:none;">Xác nhận</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scripts -->
+  <script src="../shared/logger.js"></script>
+  <script src="../shared/constants.js"></script>
+  <script src="../shared/super-share-core.js"></script>
+  <script src="js/storage.js"></script>
+  <script src="js/bridge.js"></script>
+  <script src="js/ads-table.js"></script>
+  <script src="js/super-share.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AMIT — Log &amp; báo lỗi</title>
+  <style>
+    :root {
+      --bg: #f6f6f6; --card: #fff; --text: #171717; --muted: #707070; --line: #e0e0e0;
+      --ok: #00875a; --warn: #b25e00; --err: #d32f2f; --primary: #171717;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #161616; --card: #202020; --text: #ececec; --muted: #9a9a9a; --line: #353535; --primary: #ececec; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    main { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin: 0 0 16px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+    ol { margin: 6px 0 0 18px; padding: 0; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+    .stat { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+    .stat b { display: block; font-size: 18px; }
+    .stat span { color: var(--muted); font-size: 12px; }
+    textarea { width: 100%; min-height: 70px; padding: 8px; border: 1px solid var(--line); border-radius: 6px;
+      background: var(--card); color: var(--text); font: inherit; resize: vertical; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    button { padding: 9px 16px; border-radius: 6px; border: 1px solid var(--line); background: var(--card);
+      color: var(--text); font: inherit; font-weight: 600; cursor: pointer; }
+    button.primary { background: var(--primary); color: var(--bg); border-color: var(--primary); }
+    button.danger { color: var(--err); }
+    button:disabled { opacity: .5; cursor: default; }
+    .msg { margin-top: 10px; min-height: 20px; font-size: 13px; }
+    .viewer { max-height: 340px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .viewer div { padding: 3px 8px; border-bottom: 1px solid var(--line); white-space: pre-wrap; word-break: break-word; }
+    .lvl-warn { color: var(--warn); } .lvl-error { color: var(--err); font-weight: 600; } .lvl-debug { color: var(--muted); }
+    label.inline { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Log &amp; báo lỗi</h1>
+  <p class="sub">AMIT tự ghi lại mọi thao tác, kết quả và lỗi. Bạn không cần làm gì cho đến khi gặp sự cố.</p>
+
+  <div class="card">
+    <b>Khi tính năng chạy sai hoặc báo lỗi:</b>
+    <ol>
+      <li>(Không bắt buộc) Mô tả ngắn bạn đã làm gì và thấy gì khác với mong đợi.</li>
+      <li>Bấm <b>Xuất file log</b>. File <code>AMIT-log-….txt</code> sẽ được tải về máy.</li>
+      <li>Gửi file đó cho người phát triển.</li>
+    </ol>
+    <p class="sub" style="margin:10px 0 0">File log có ID tài khoản quảng cáo và UID Facebook (cần để tìm lỗi). Token, cookie, API key và tên người dùng đã được che.</p>
+  </div>
+
+  <div class="card">
+    <div class="stats" id="stats"></div>
+  </div>
+
+  <div class="card">
+    <label for="note"><b>Mô tả vấn đề (tùy chọn)</b></label>
+    <textarea id="note" placeholder="Ví dụ: Chạy 'Chia sẻ vai trò' cho TKQC 123… thì báo lỗi UI_TARGET_AMBIGUOUS, trên Facebook thấy nút 'Thêm người' bị mờ."></textarea>
+    <div class="row">
+      <button class="primary" id="exportBtn">Xuất file log</button>
+      <button id="refreshBtn">Làm mới</button>
+      <button class="danger" id="clearBtn">Xóa log</button>
+    </div>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+      <b>Các dòng log gần nhất</b>
+      <label class="inline"><input type="checkbox" id="onlyProblems"> Chỉ cảnh báo / lỗi</label>
+    </div>
+    <div class="viewer" id="viewer" style="margin-top:8px"></div>
+  </div>
+</main>
+
+<script src="../../shared/logger.js"></script>
+<script src="logs.js"></script>
+</body>
+</html>
