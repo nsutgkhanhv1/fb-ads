@@ -16,6 +16,12 @@
  *   removePerson(uid)        -> xóa người + confirm
  *   settle()                 -> chờ UI cập nhật sau write (technical wait, KHÔNG phải batch delay)
  *   probeSelfRemoval(actId, selfUid) -> { facebookConfirmed, accountGone, noAccess, stillInList } (true|false|null)
+ *
+ * TÙY CHỌN (driver Graph — extension/services/permission-service.js):
+ *   engine                   -> "graph" | "dom" (mặc định "dom")
+ *   requiresIdentity         -> true: luôn xác nhận executor_uid == chủ token trước mọi write (không chỉ action phụ thuộc SELF)
+ *   readRoles() entry thêm   -> { protected: true } cho owner của TKQC (không bao giờ bị xóa)
+ *   targetMeta(uid)          -> { method_used, ambiguous, ambiguous_error, ... } đính vào kết quả từng UID
  */
 (function (root) {
   "use strict";
@@ -54,12 +60,24 @@
     "KEEP_UID_NOT_FOUND", "EXECUTOR_IDENTITY_MISMATCH", "NO_OTHER_ADMIN",
     "ROLE_CHANGE_NOT_AVAILABLE", "ROLE_CHANGE_VERIFY_FAILED",
     // ngoài docx:
-    "SELF_NOT_IDENTIFIED", "TARGET_IS_SELF", "INVALID_INPUT"
+    "SELF_NOT_IDENTIFIED", "TARGET_IS_SELF", "INVALID_INPUT",
+    // Graph engine (docx "Định hướng kiến trúc AMIT Super Share" §12.1)
+    "FACEBOOK_REAUTH_REQUIRED", "TOKEN_UNAVAILABLE", "TOKEN_OWNER_MISMATCH", "TARGET_NOT_ELIGIBLE", "TARGET_NOT_FOUND",
+    "OWNER_PROTECTED", "RATE_LIMITED", "NETWORK_ERROR", "REQUEST_TIMEOUT", "FACEBOOK_GRAPH_ERROR", "GRAPH_RESPONSE_INVALID",
+    "VERIFY_UNAVAILABLE", "VERIFY_MISMATCH", "ROLE_MISMATCH", "CANCELLED"
   ];
   const ERR = Object.freeze(Object.fromEntries(ERROR_CODES.map(c => [c, c])));
 
-  // Lỗi làm PAUSE cả batch (docx §15)
-  const PAUSE_CODES = Object.freeze([ERR.SESSION_EXPIRED, ERR.FACEBOOK_CHECKPOINT]);
+  // Lỗi làm PAUSE cả batch (docx §15; Graph engine thêm reauth / token / rate limit)
+  const PAUSE_CODES = Object.freeze([
+    ERR.SESSION_EXPIRED, ERR.FACEBOOK_CHECKPOINT, ERR.FACEBOOK_REAUTH_REQUIRED, ERR.TOKEN_UNAVAILABLE, ERR.RATE_LIMITED
+  ]);
+
+  // Chỉ dùng cho Graph engine: lỗi tạm thời hoặc target CHƯA XÁC MINH mới được Retry (docx §11, AC09).
+  const RETRYABLE_CODES = Object.freeze([
+    ERR.NETWORK_ERROR, ERR.REQUEST_TIMEOUT, ERR.RATE_LIMITED, ERR.FACEBOOK_GRAPH_ERROR, ERR.GRAPH_RESPONSE_INVALID,
+    ERR.VERIFY_UNAVAILABLE, ERR.SHARE_VERIFY_FAILED, ERR.REMOVE_VERIFY_FAILED, ERR.ROLE_CHANGE_VERIFY_FAILED
+  ]);
 
   const STATUS = Object.freeze({
     PENDING: "PENDING", RUNNING: "RUNNING", SUCCESS: "SUCCESS", FAILED: "FAILED", PAUSED: "PAUSED"
@@ -111,7 +129,8 @@
       target_uids: def && def.uid ? uids : [],
       _rawUidCount: uids.length,
       role,
-      executor_uid: uidStr(raw.executor_uid) || null
+      executor_uid: uidStr(raw.executor_uid) || null,
+      source: raw.source ? String(raw.source).toUpperCase() : null // "UID" | "BM_PICKER" (chỉ Graph engine dùng để chọn contract)
     };
   }
 
@@ -150,6 +169,10 @@
       target_uids: item.target_uids.slice(),
       role: item.role,
       executor_uid: item.executor_uid,
+      source: item.source || null,
+      engine: null,
+      request_id: null,
+      retryable: null,
       started_at: null,
       finished_at: null,
       step: null,
@@ -162,14 +185,15 @@
     };
   }
 
-  function setTarget(result, uid, status, note, code, message) {
+  function setTarget(result, uid, status, note, code, message, extra) {
     let t = result.targets.find(x => x.uid === uid);
     if (!t) { t = { uid }; result.targets.push(t); }
     t.status = status;
     t.note = note || null;
     t.error_code = code || null;
     t.error_message = message || null;
-    LOG(status === STATUS.FAILED ? "warn" : "info", "core.target", { ad_account_id: result.ad_account_id, uid, status, note: t.note, error_code: t.error_code, error_message: t.error_message });
+    if (extra) Object.assign(t, extra); // request_id, method_used, verify_state, retryable (Graph engine)
+    LOG(status === STATUS.FAILED ? "warn" : "info", "core.target", { ad_account_id: result.ad_account_id, uid, status, note: t.note, error_code: t.error_code, error_message: t.error_message, method_used: t.method_used, verify_state: t.verify_state, request_id: t.request_id });
     return t;
   }
 
@@ -179,6 +203,10 @@
     const failed = result.targets.filter(t => t.status === STATUS.FAILED);
     if (result.error_code || failed.length) {
       result.status = STATUS.FAILED;
+      if (result.engine === "graph") {
+        const codes = result.error_code ? [result.error_code] : failed.map(t => t.error_code);
+        result.retryable = codes.some(c => RETRYABLE_CODES.includes(c));
+      }
       if (!result.error_code) {
         result.error_code = failed[0].error_code;
         result.failed_uid = failed[0].uid;
@@ -198,6 +226,20 @@
   // TRỢ GIÚP ĐỌC STATE
   // ============================================================
   const findRole = (roles, uid) => roles.find(r => r.uid === uid) || null;
+  const isGraph = driver => !!driver && driver.engine === "graph";
+  const metaOf = (driver, uid) => (driver && typeof driver.targetMeta === "function" ? driver.targetMeta(uid) : null) || null;
+
+  /** Đọc lại sau write. Graph engine: không đọc được -> VERIFY_UNAVAILABLE (UNVERIFIED), không coi là thành công. */
+  async function verifyRead(driver, ctx) {
+    try {
+      return await readRolesChecked(driver, false);
+    } catch (e) {
+      if (!isGraph(driver) || (e instanceof DriverError && isPauseCode(e.code))) throw e;
+      if (ctx) ctx.verify_state = "UNAVAILABLE";
+      throw new DriverError(ERR.VERIFY_UNAVAILABLE,
+        `Đã gửi yêu cầu nhưng không đọc lại được trạng thái để xác minh (${e && e.message ? e.message : e}).`, "VERIFY", { verify_state: "UNAVAILABLE" });
+    }
+  }
 
   async function readRolesChecked(driver, requireAllUids) {
     const roles = await driver.readRoles();
@@ -212,7 +254,8 @@
   // ============================================================
   // SHARE_USER (docx §6, §40, §59)
   // ============================================================
-  async function shareOne(driver, item, uid) {
+  async function shareOne(driver, item, uid, ctx) {
+    ctx = ctx || {};
     const role = item.role;
     let roles = await readRolesChecked(driver, false);
     const cur = findRole(roles, uid);
@@ -222,47 +265,64 @@
       if (cur.role === null) {
         throw new DriverError(ERR.UI_VARIANT_UNKNOWN, `Không đọc được role hiện tại của UID ${uid} nên không thể quyết định đổi role.`, "READ_STATE");
       }
-      if (cur.role === role) return "NO_ACTION_REQUIRED"; // §40
+      if (cur.role === role) { ctx.verify_state = "MATCH"; return "NO_ACTION_REQUIRED"; } // §40
       await driver.assertContext(item.ad_account_id);
       await driver.changeRole(uid, role);
       await driver.settle();
-      roles = await readRolesChecked(driver, false);
+      roles = await verifyRead(driver, ctx);
       const after = findRole(roles, uid);
       if (!after || after.role !== role) {
-        throw new DriverError(ERR.ROLE_CHANGE_VERIFY_FAILED,
+        ctx.verify_state = !after ? "MISSING" : "MISMATCH";
+        throw new DriverError(isGraph(driver) && after ? ERR.ROLE_MISMATCH : ERR.ROLE_CHANGE_VERIFY_FAILED,
           `Đã đổi role nhưng sau khi đọc lại role hiện tại là ${after ? after.role || after.roleText : "(không còn)"}.`, "VERIFY");
       }
-      return "ROLE_CHANGED";
+      ctx.verify_state = "MATCH";
+      return verifiedNote(driver, uid, "ROLE_CHANGED");
     }
 
     await driver.assertContext(item.ad_account_id);
     await driver.addPerson(uid, role);
     await driver.settle();
-    roles = await readRolesChecked(driver, false);
+    roles = await verifyRead(driver, ctx);
     const added = findRole(roles, uid);
     if (!added || added.role !== role) {
-      throw new DriverError(ERR.SHARE_VERIFY_FAILED,
+      ctx.verify_state = !added ? "MISSING" : "MISMATCH";
+      throw new DriverError(isGraph(driver) && added ? ERR.ROLE_MISMATCH : ERR.SHARE_VERIFY_FAILED,
         added ? `UID đã xuất hiện nhưng role là ${added.role || added.roleText}, khác role yêu cầu ${role}.` : "UID chưa xuất hiện trong danh sách vai trò sau khi thêm.",
         "VERIFY");
     }
-    return "ADDED";
+    ctx.verify_state = "MATCH";
+    return verifiedNote(driver, uid, "ADDED");
+  }
+
+  /** Phản hồi mutation mơ hồ nhưng đọc lại khớp -> ghi rõ (docx §11.1). */
+  function verifiedNote(driver, uid, note) {
+    const m = metaOf(driver, uid);
+    return m && m.ambiguous ? "VERIFIED_AFTER_AMBIGUOUS_RESPONSE" : note;
   }
 
   // ============================================================
   // REMOVE (docx §7, §41)
   // ============================================================
-  async function removeOne(driver, item, uid) {
+  async function removeOne(driver, item, uid, ctx) {
+    ctx = ctx || {};
     const roles = await readRolesChecked(driver, false);
-    LOG("info", "core.remove.decision", { uid, present: !!findRole(roles, uid), roles_now: roles.length });
-    if (!findRole(roles, uid)) return "NO_ACTION_REQUIRED";
+    const cur = findRole(roles, uid);
+    LOG("info", "core.remove.decision", { uid, present: !!cur, roles_now: roles.length });
+    if (!cur) { ctx.verify_state = "MATCH"; return "NO_ACTION_REQUIRED"; }
+    if (cur.protected) {
+      throw new DriverError(ERR.OWNER_PROTECTED, `UID ${uid} là chủ sở hữu của TKQC nên không thể bị gỡ quyền.`, "PRE_VALIDATE");
+    }
     await driver.assertContext(item.ad_account_id);
     await driver.removePerson(uid);
     await driver.settle();
-    const after = await readRolesChecked(driver, false);
+    const after = await verifyRead(driver, ctx);
     if (findRole(after, uid)) {
+      ctx.verify_state = "MISMATCH";
       throw new DriverError(ERR.REMOVE_VERIFY_FAILED, `UID ${uid} vẫn còn trong danh sách vai trò sau khi xóa.`, "VERIFY");
     }
-    return "REMOVED";
+    ctx.verify_state = "MATCH";
+    return verifiedNote(driver, uid, "REMOVED");
   }
 
   const toTargetFailure = e => ({
@@ -270,16 +330,32 @@
     message: e && e.message ? e.message : String(e)
   });
 
+  /** Thông tin Graph engine đính vào từng UID (request_id, method_used, verify_state, retryable). Rỗng với DOM engine. */
+  function graphExtras(driver, result, uid, ctx, failedCode) {
+    if (!isGraph(driver)) return null;
+    const m = metaOf(driver, uid) || {};
+    const extra = { request_id: result.request_id ? `${result.request_id}:${uid}` : null, method_used: m.method_used || null, verify_state: ctx.verify_state || null };
+    if (failedCode) extra.retryable = RETRYABLE_CODES.includes(failedCode);
+    return extra;
+  }
+
   /** Mỗi UID xử lý riêng; lỗi một UID không dừng UID còn lại, trừ lỗi PAUSE (docx §39, §41). */
-  async function forEachTarget(result, uids, fn) {
+  async function forEachTarget(result, uids, fn, driver) {
     for (const uid of uids) {
+      const ctx = {};
       try {
-        const note = await fn(uid);
-        setTarget(result, uid, STATUS.SUCCESS, note);
+        const note = await fn(uid, ctx);
+        setTarget(result, uid, STATUS.SUCCESS, note, null, null, graphExtras(driver, result, uid, ctx, null));
       } catch (e) {
         if (e instanceof DriverError && isPauseCode(e.code)) throw e;
-        const f = toTargetFailure(e);
-        setTarget(result, uid, STATUS.FAILED, null, f.code, f.message);
+        let f = toTargetFailure(e);
+        if (e instanceof DriverError && e.detail && e.detail.verify_state && !ctx.verify_state) ctx.verify_state = e.detail.verify_state;
+        // Mutation bị timeout / lỗi mạng rồi verify cũng không khớp: báo lỗi GỐC (có thể retry), không phải "verify failed" chung chung.
+        const m = metaOf(driver, uid);
+        if (m && m.ambiguous_error && /VERIFY/.test(f.code)) {
+          f = { code: m.ambiguous_error.code, message: `${m.ambiguous_error.message} (đã đọc lại: trạng thái chưa như yêu cầu)` };
+        }
+        setTarget(result, uid, STATUS.FAILED, null, f.code, f.message, graphExtras(driver, result, uid, ctx, f.code));
         if (e instanceof DriverError && e.detail && !result.detail) result.detail = e.detail;
       }
     }
@@ -298,7 +374,7 @@
         uids.push(uid);
       }
     }
-    await forEachTarget(result, uids, uid => removeOne(driver, item, uid));
+    await forEachTarget(result, uids, (uid, ctx) => removeOne(driver, item, uid, ctx), driver);
   }
 
   // REMOVE_ALL_EXCEPT_UIDS_AND_SELF (03) và REMOVE_ALL_EXCEPT_SELF (04) dùng chung (docx §9)
@@ -326,8 +402,9 @@
 
     const keepSet = new Set([self, ...keep]);
     const existedKeep = [...keepSet].filter(u => findRole(roles, u));
-    const removeUids = roles.map(r => r.uid).filter(u => !keepSet.has(u));
-    LOG("info", "core.removeall.plan", { self, keep, keep_validated: validateKeep, roles: roles.map(r => ({ uid: r.uid, role: r.role })), remove_set: removeUids });
+    const protectedUids = roles.filter(r => r.protected).map(r => r.uid);
+    const removeUids = roles.map(r => r.uid).filter(u => !keepSet.has(u) && !protectedUids.includes(u)); // owner không bao giờ bị xóa
+    LOG("info", "core.removeall.plan", { self, keep, protected_owner: protectedUids, keep_validated: validateKeep, roles: roles.map(r => ({ uid: r.uid, role: r.role })), remove_set: removeUids });
 
     setStep(result, "EXECUTE");
     if (!removeUids.length) {
@@ -335,7 +412,7 @@
       return;
     }
     // Mỗi lần xóa đều đọc lại state (removeOne), không dùng index cố định (docx §8, §33)
-    await forEachTarget(result, removeUids, uid => removeOne(driver, item, uid));
+    await forEachTarget(result, removeUids, (uid, ctx) => removeOne(driver, item, uid, ctx), driver);
 
     // Final verification (docx §8)
     setStep(result, "VERIFY");
@@ -360,6 +437,9 @@
     }
     if (me.role === null) {
       throw new DriverError(ERR.UI_VARIANT_UNKNOWN, "Không đọc được role hiện tại của SELF nên không thể áp dụng rule Admin. Không thực hiện xóa.", "READ_STATE");
+    }
+    if (me.protected) {
+      throw new DriverError(ERR.OWNER_PROTECTED, "Via đang thực thi là chủ sở hữu của TKQC nên không thể tự gỡ quyền.", "PRE_VALIDATE");
     }
 
     LOG("info", "core.removeself.check", { self_role: me.role, roles: roles.map(r => ({ uid: r.uid, role: r.role })) });
@@ -392,7 +472,7 @@
           : "Không có tín hiệu nào xác nhận SELF đã bị xóa (Facebook không xác nhận, TKQC vẫn truy cập được).",
         "VERIFY", { signals: sig || null });
     }
-    setTarget(result, self, STATUS.SUCCESS, "REMOVED");
+    setTarget(result, self, STATUS.SUCCESS, "REMOVED", null, null, graphExtras(driver, result, self, { verify_state: "MATCH" }, null));
     result.note = "SELF_REMOVED"; // AMIT phải sync lại dataset (docx §28)
   }
 
@@ -411,6 +491,8 @@
     const result = newItemResult(item);
     result.status = STATUS.RUNNING;
     result.started_at = now();
+    result.engine = driver && driver.engine ? driver.engine : "dom";
+    result.request_id = opts.requestId || `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     LOG("info", "core.item.start", { ad_account_id: item.ad_account_id, action: item.action, target_uids: item.target_uids, role: item.role, executor_uid: item.executor_uid });
 
     const invalid = validateItem(item);
@@ -428,8 +510,8 @@
       if (state === "EXPIRED") throw new DriverError(ERR.SESSION_EXPIRED, "Facebook yêu cầu đăng nhập lại.", "SESSION");
       if (state === "CHECKPOINT") throw new DriverError(ERR.FACEBOOK_CHECKPOINT, "Facebook yêu cầu xác minh bảo mật (checkpoint).", "SESSION");
 
-      if (def.selfDependent) {
-        // §26: không đoán SELF
+      if (def.selfDependent || driver.requiresIdentity) {
+        // §26: không đoán SELF. Graph engine: mọi write đều phải biết token thuộc ai (AC05)
         setStep(result, "IDENTITY");
         const current = await driver.getSessionUid();
         if (!item.executor_uid) {
@@ -460,7 +542,7 @@
               uids.push(uid);
             }
           }
-          await forEachTarget(result, uids, uid => shareOne(driver, item, uid));
+          await forEachTarget(result, uids, (uid, ctx) => shareOne(driver, item, uid, ctx), driver);
           break;
         }
         case ACTIONS.REMOVE_BY_UID_EXCEPT_SELF:
@@ -532,22 +614,26 @@
     const out = [];
     for (const it of batch.items) {
       if (it.status !== STATUS.FAILED) continue;
+      if (it.retryable === false) continue; // Graph engine: lỗi không tạm thời (quyền, target không hợp lệ...) -> Retry không giúp ích
       const def = ACTION_DEFS[it.action];
-      const failedUids = it.targets.filter(t => t.status === STATUS.FAILED && it.target_uids.includes(t.uid)).map(t => t.uid);
+      // Graph engine: target retryable === false (vd INSUFFICIENT_PERMISSION) bị bỏ qua; DOM engine không có cờ này nên giữ hành vi cũ.
+      const failedUids = it.targets.filter(t => t.status === STATUS.FAILED && it.target_uids.includes(t.uid) && t.retryable !== false).map(t => t.uid);
+      if (it.targets.some(t => t.status === STATUS.FAILED) && !failedUids.length && def && def.retryByTarget) continue;
       const byTarget = def && def.retryByTarget && failedUids.length > 0;
       out.push({
         ad_account_id: it.ad_account_id,
         action: it.action,
         target_uids: byTarget ? failedUids : it.target_uids.slice(),
         role: it.role,
-        executor_uid: it.executor_uid
+        executor_uid: it.executor_uid,
+        source: it.source || null
       });
     }
     return out;
   }
 
   const api = {
-    ACTIONS, ROLES, DEFAULT_ROLE, ACTION_DEFS, ERR, ERROR_CODES, PAUSE_CODES, STATUS, BATCH_STATUS, DELAY,
+    ACTIONS, ROLES, DEFAULT_ROLE, ACTION_DEFS, ERR, ERROR_CODES, PAUSE_CODES, RETRYABLE_CODES, STATUS, BATCH_STATUS, DELAY,
     DriverError, isPauseCode,
     normalizeItem, validateItem, clampDelay,
     newItemResult, newBatch, recount, isResumable, buildRetryItems,

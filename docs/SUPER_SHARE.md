@@ -18,7 +18,7 @@ Cấu hình + hiển thị   ──msg──►  batch-controller.js            
 - **`shared/super-share-core.js`**: 5 action, validate input, pre-validate keep-list, `NO_OTHER_ADMIN`, identity, verify, kết quả theo từng UID, mã lỗi. Web, Extension và test dùng chung một nguồn.
 - **`extension/content-scripts/executor.js`**: chỉ thao tác UI. Mọi nhãn và pattern nằm trong `CONFIG` ở đầu file.
 - **`extension/batch-controller.js`**: điều phối batch, không chứa logic nghiệp vụ.
-- Đã **bỏ toàn bộ ghi vai trò qua Graph API** (`shareRoleToUser`, `removeRole…`). Graph API chỉ còn dùng để đồng bộ dữ liệu Ads Check.
+- Hai engine thực thi cùng dùng core này: **DOM** (mặc định, `executor.js`) và **Graph** (thử nghiệm, xem mục "Graph engine" cuối tài liệu). Chọn bằng feature flag `super_share_engine` trong popup.
 
 ## Ánh xạ docx → code
 
@@ -152,3 +152,44 @@ npm test
 - `core.test.js`: toàn bộ rule nghiệp vụ bằng driver giả.
 - `controller.test.js`: batch, delay, PAUSED/resume, retry, khôi phục khi service worker bị tắt (API Chrome giả).
 - `executor.test.js`, `web.test.js`: DOM giả (jsdom). **Chỉ chứng minh cơ chế code, không chứng minh khớp giao diện Meta thật.**
+
+## Graph engine (`AMIT_Super_Share_Dinh_Huong_Kien_Truc.docx`)
+
+Thay thao tác DOM bằng Facebook Graph chạy trong service worker. **Mặc định vẫn là DOM**; bật Graph ở popup → "Engine Super Share" (áp dụng cho batch tạo sau đó; engine được chốt trong `batch.engine`). Rollback = chọn lại DOM, không đổi dữ liệu lịch sử.
+
+```
+Web ──► batch-controller.js ──► AmitPermissionService (driver Graph) ──► AmitGraphClient ──► AmitTokenProvider
+                │                      ▲ cùng interface driver với DOM          │ POST/GET v24.0        │ token_b + xác minh chủ token (/me)
+                └── super-share-core.js (luật nghiệp vụ, verify, guard)         └── AmitFbErrors (phân loại lỗi)
+```
+
+| Module | Vai trò |
+|---|---|
+| `shared/facebook/permission-contracts.js` | role ID 1001/1002/1003, tasks, dựng request `users` / `assigned_users` / revoke |
+| `shared/facebook/error-classifier.js` | lỗi Graph/mạng/redirect -> mã chuẩn, `retryable`, `pause`, `fallback_allowed` |
+| `shared/facebook/token-provider.js` | token theo mục đích, cache + TTL + generation, kiểm tra chủ token |
+| `shared/facebook/graph-client.js` | v24, token trong body, timeout 60s, retry token 1 lần, không tự retry mutation |
+| `extension/services/permission-service.js` | driver Graph cho core, chọn contract, fallback có kiểm soát, bằng chứng REMOVE_SELF |
+| `extension/services/permission-message-handler.js` | runtime singleton, feature flag, message `permission_execute` |
+
+Khác biệt hành vi so với DOM (core chỉ đổi khi `driver.engine === "graph"`):
+
+- **Danh tính**: mọi write (kể cả SHARE_USER) bắt buộc có `executor_uid` khớp chủ token; token được xác minh bằng `/me`, không tin regex.
+- **Mutation thành công** khi `success === true`. Thiếu `success`, timeout, 5xx = *mơ hồ*: core đọc lại; khớp → `VERIFIED_AFTER_AMBIGUOUS_RESPONSE`, không khớp → FAILED với mã gốc (`REQUEST_TIMEOUT`...). Không tự gửi lại mutation.
+- **Đọc lại không được** sau khi đã gửi → `VERIFY_UNAVAILABLE`, `verify_state: UNAVAILABLE` (tương đương UNVERIFIED trong docx; vẫn là `FAILED` + `retryable` ở model hiện tại).
+- **Fallback** `users` ↔ `assigned_users` / `userpermissions` chỉ khi lỗi là *target không đủ điều kiện*; lỗi quyền, session, account, rate limit không bao giờ fallback.
+- **Owner** của TKQC không bao giờ bị xóa (`OWNER_PROTECTED`).
+- **REMOVE_SELF**: sau khi gỡ, đọc lại bị từ chối quyền = bằng chứng đã gỡ (`noAccess`); lỗi mạng/khác = không có tín hiệu → FAILED.
+- **Pause**: `SESSION_EXPIRED`, `FACEBOOK_CHECKPOINT`, `FACEBOOK_REAUTH_REQUIRED`, `TOKEN_UNAVAILABLE`, `RATE_LIMITED` (rate limit nhận diện theo mã lỗi Graph 4/17/32/613/… không chỉ HTTP 429). Tiếp tục bằng nút "Tiếp tục" như cũ.
+- **Retry** chỉ gửi lại target lỗi tạm thời hoặc chưa xác minh (`retryable`), bỏ qua lỗi quyền / target không hợp lệ.
+- **Pacing**: 1–3 giây giữa các mutation cùng TKQC, 2–5 giây giữa TKQC (delay người dùng chọn > 5 giây thì tôn trọng); mutation tuần tự.
+- Kết quả từng UID có thêm `request_id`, `method_used`, `verify_state`, `retryable`.
+
+### Chưa được kiểm chứng trên Facebook thật (đọc trước khi bật cho người dùng)
+
+1. Contract **gỡ quyền** (`POST /act_{id}/users/{uid}` + `method=DELETE`, và `userpermissions`) là theo đặc tả AMIT, **không** có trong bằng chứng SMIT. Chạy `spikes/spike3-graph-contracts.js` trên TKQC thử nghiệm.
+2. Mẫu thông báo nhận ra "target không đủ điều kiện" / "TKQC không tồn tại" trong `error-classifier.js` là suy đoán; mẫu lạ thì không fallback.
+3. Mã lỗi khi tự gỡ chính mình rồi đọc lại (đang coi `INSUFFICIENT_PERMISSION` / `ACCOUNT_NOT_FOUND` là bằng chứng) cần xác nhận bằng log thật.
+4. DNR rule đã thu hẹp về request do chính extension phát (`initiatorDomains`); cần kiểm tra Ads Check (discovery, inspect) vẫn chạy.
+5. Concurrency mutation = 1 mỗi Via; chưa có telemetry tỷ lệ lỗi theo endpoint (log sự kiện `permission.*`, `token.*` đã có, metric tổng hợp chưa làm).
+6. Ngưỡng nghiệm thu AC10 / AC11 (tỷ lệ verify thành công, P95) cần được đội sản phẩm đặt số cụ thể.

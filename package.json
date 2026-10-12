@@ -3,8 +3,9 @@
   "private": true,
   "description": "AMIT V1 - Ads Check & Super Share (Chrome extension)",
   "scripts": {
-    "test": "node tests/core.test.js && node tests/fbapi.test.js && node tests/logger.test.js && node tests/jev.test.js && node tests/controller.test.js && node tests/executor.test.js && node tests/logging.test.js && node tests/web.test.js",
+    "test": "node tests/core.test.js && node tests/fbapi.test.js && node tests/logger.test.js && node tests/jev.test.js && node tests/controller.test.js && node tests/executor.test.js && node tests/logging.test.js && node tests/web.test.js && node tests/graph.test.js",
     "test:core": "node tests/core.test.js",
+    "test:graph": "node tests/graph.test.js",
     "pack": "node scripts/pack.js"
   },
   "devDependencies": {

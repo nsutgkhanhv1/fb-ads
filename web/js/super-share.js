@@ -79,8 +79,20 @@ const AmitSuperShare = {
   PAUSE_TEXT: {
     SESSION_EXPIRED: "Facebook đã hết phiên đăng nhập. Đăng nhập lại Facebook trên Chrome rồi bấm Tiếp tục.",
     FACEBOOK_CHECKPOINT: "Facebook yêu cầu xác minh bảo mật (checkpoint). Xử lý xong trên Chrome rồi bấm Tiếp tục.",
+    FACEBOOK_REAUTH_REQUIRED: "Facebook yêu cầu xác thực lại (reauth). Xử lý xong trên Chrome rồi bấm Tiếp tục.",
+    TOKEN_UNAVAILABLE: "Chưa lấy được token Ads Manager. Mở https://adsmanager.facebook.com một lần trên Chrome rồi bấm Tiếp tục.",
+    RATE_LIMITED: "Facebook đang giới hạn tốc độ. Chờ vài phút rồi bấm Tiếp tục (các TKQC chưa xong được giữ nguyên trong hàng đợi).",
     EXTENSION_RESTARTED: "Extension vừa khởi động lại giữa chừng. Bấm Tiếp tục để chạy các TKQC chưa xong (TKQC đã xong không chạy lại).",
     CONTROLLER_ERROR: "Hệ thống gặp lỗi nội bộ. Bấm Tiếp tục để thử lại các TKQC chưa xong."
+  },
+
+  /** Graph engine: phương thức đã dùng, trạng thái xác minh, có Retry được không (rỗng với DOM engine). */
+  targetTech(t) {
+    const bits = [];
+    if (t.method_used) bits.push(this.esc(t.method_used));
+    if (t.verify_state) bits.push("verify: " + this.esc(t.verify_state));
+    if (t.retryable === false) bits.push("không thể Retry");
+    return bits.length ? ` <span style="color:#888">(${bits.join(" · ")})</span>` : "";
   },
 
   applyBatch(batch) {
@@ -162,7 +174,7 @@ const AmitSuperShare = {
     list.innerHTML = failed.map(it => {
       const bad = (it.targets || []).filter(t => t.status === "FAILED");
       const targets = bad.length
-        ? `<ul style="margin:2px 0 0 16px;padding:0">${bad.map(t => `<li>UID <b>${this.esc(t.uid)}</b>: <code>${this.esc(t.error_code)}</code> — ${this.esc(t.error_message)}</li>`).join("")}</ul>`
+        ? `<ul style="margin:2px 0 0 16px;padding:0">${bad.map(t => `<li>UID <b>${this.esc(t.uid)}</b>: <code>${this.esc(t.error_code)}</code> — ${this.esc(t.error_message)}${this.targetTech(t)}</li>`).join("")}</ul>`
         : "";
       return `<div style="padding:6px 0;border-bottom:1px solid #eee">
         <b>TKQC ${this.esc(it.ad_account_id)}</b> · ${this.esc(it.action)}<br>
@@ -875,7 +887,7 @@ const AmitSuperShare = {
       const frac = total > 1 ? ` (${okN}/${total} UID)` : "";
       const f = failedById.get(String(id));
       const bad = f && (f.targets || []).length
-        ? `<ul style="margin:2px 0 0 16px;padding:0">${f.targets.map(t => `<li>UID <b>${this.esc(t.uid)}</b>: <code>${this.esc(t.error_code)}</code> — ${this.esc(t.error_message)}</li>`).join("")}</ul>`
+        ? `<ul style="margin:2px 0 0 16px;padding:0">${f.targets.map(t => `<li>UID <b>${this.esc(t.uid)}</b>: <code>${this.esc(t.error_code)}</code> — ${this.esc(t.error_message)}${this.targetTech(t)}</li>`).join("")}</ul>`
         : "";
       return `<tr style="border-bottom:1px solid #eee;vertical-align:top">
         <td style="padding:4px 6px"><b>${this.esc(id)}</b></td>

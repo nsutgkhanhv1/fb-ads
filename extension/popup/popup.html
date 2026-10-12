@@ -103,6 +103,18 @@
       <div id="savedViasList" style="max-height:130px;overflow-y:auto;"></div>
     </div>
 
+    <!-- Engine Super Share (feature flag super_share_engine) -->
+    <div class="card" id="engineCard">
+      <div style="font-weight:700;font-size:11px;color:#707070;margin-bottom:8px;text-transform:uppercase;">
+        Engine Super Share
+      </div>
+      <select id="engineSelect" style="width:100%;padding:6px;margin-top:6px;">
+        <option value="dom">DOM — thao tác giao diện Ads Manager (mặc định)</option>
+        <option value="graph">Graph — gọi Facebook Graph (thử nghiệm)</option>
+      </select>
+      <div class="status-msg" id="engineMsg" style="margin-top:8px;">Graph chỉ nên bật trên TKQC thử nghiệm cho tới khi đạt tiêu chí nghiệm thu. Áp dụng cho batch tạo SAU khi đổi.</div>
+    </div>
+
     <!-- Jev (OpenRouter): NƠI DUY NHẤT để đặt API key -->
     <div class="card" id="jevCard">
       <div style="font-weight:700;font-size:11px;color:#707070;margin-bottom:8px;text-transform:uppercase;">

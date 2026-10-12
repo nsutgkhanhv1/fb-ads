@@ -4,7 +4,9 @@
  */
 
 const AmitFbApi = {
-  GRAPH_URL: "https://graph.facebook.com/v19.0",
+  // Một nơi duy nhất đổi phiên bản Graph cho phần đọc dữ liệu Ads Check (Super Share dùng AmitGraphClient, mặc định cũng v24.0).
+  GRAPH_VERSION: "v24.0",
+  get GRAPH_URL() { return `https://graph.facebook.com/${this.GRAPH_VERSION}`; },
   GRAPHQL_URL: "https://adsmanager.facebook.com/api/graphql/",
 
   /**
