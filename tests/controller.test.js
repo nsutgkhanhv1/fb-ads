@@ -4,6 +4,8 @@ const vm = require("vm");
 const ROOT = (process.argv[2] || require("path").resolve(__dirname, ".."));
 const coreSrc = fs.readFileSync(path.join(ROOT, "shared/super-share-core.js"), "utf8");
 const ctrlSrc = fs.readFileSync(path.join(ROOT, "extension/batch-controller.js"), "utf8");
+const metricsSrc = fs.readFileSync(path.join(ROOT, "shared/metrics.js"), "utf8");
+const metricsSvcSrc = fs.readFileSync(path.join(ROOT, "extension/services/metrics-service.js"), "utf8");
 
 let pass = 0, fail = 0;
 const ok = (name, cond, extra) => { cond ? pass++ : fail++; console.log((cond ? "PASS " : "FAIL ") + name + (cond ? "" : "  -> " + JSON.stringify(extra).slice(0, 500))); };
@@ -47,6 +49,8 @@ function build({ cookie = "1", storage = {}, driverFor }) {
   ctx.getFacebookCookie = async () => ctx.__cookie;
   ctx.__cookie = cookie;
   vm.runInContext(coreSrc, ctx);
+  vm.runInContext(metricsSrc, ctx);
+  vm.runInContext(metricsSvcSrc, ctx);
   vm.runInContext(ctrlSrc, ctx);
   return { ctx, events, store, setCookie: c => { ctx.__cookie = c; }, windows,
     batch: () => vm.runInContext("currentBatch", ctx) };
@@ -90,6 +94,16 @@ const waitFinished = async (sw, ms) => { const end = Date.now() + ms; while (Dat
   ok("runner: mở Ads Manager gốc 1 lần rồi tới trang settings theo act=", sw.events.filter(e => e[0] === "NAV")[0][1] === "https://adsmanager.facebook.com/" && sw.events.some(e => e[0] === "NAV" && /ad_account_settings\?act=300$/.test(e[1])));
   ok("runner: đóng cửa sổ khi xong", sw.events.some(e => e[0] === "WINDOW_CLOSE"));
   ok("store: batch được lưu bền vững", sw.store.amit_batch_current && sw.store.amit_batch_current.status === "FINISHED");
+
+  // 1b. DOM engine cũng được ghi số liệu để AC11 có phía so sánh
+  {
+    const snapD = await vm.runInContext("AmitMetricsRuntime.get().snapshot()", sw.ctx);
+    const dom = snapD.targets.filter(r => r.engine === "dom");
+    ok("metrics DOM: 3 TKQC -> 3 bản ghi engine dom (2 SUCCESS, 1 FAILED ACCOUNT_NOT_FOUND), có thời gian", dom.length === 3 && dom.filter(r => r.status === "SUCCESS").length === 2 && dom.some(r => r.error_code === "ACCOUNT_NOT_FOUND" && r.status === "FAILED") && dom.every(r => r.item_ms >= 0 && r.target_ms >= 0), dom);
+    ok("metrics DOM: delay giữa các TKQC (3 giây) KHÔNG nằm trong thời gian xử lý TKQC", dom.every(r => r.item_ms < 2500), dom.map(r => r.item_ms));
+    ok("metrics DOM: không có verify_state (AC10 chỉ áp cho Graph); không ghi UID", dom.every(r => r.verify_state === null && !("uid" in r)));
+    ok("metrics DOM: không có sự kiện batch_paused khi chạy suôn", !snapD.events.some(e => e.name === "batch_paused"));
+  }
 
   // 2. Retry chỉ phần lỗi (TKQC 200)
   world["200"].noAccount = false;

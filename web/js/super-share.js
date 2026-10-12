@@ -81,7 +81,7 @@ const AmitSuperShare = {
     FACEBOOK_CHECKPOINT: "Facebook yêu cầu xác minh bảo mật (checkpoint). Xử lý xong trên Chrome rồi bấm Tiếp tục.",
     FACEBOOK_REAUTH_REQUIRED: "Facebook yêu cầu xác thực lại (reauth). Xử lý xong trên Chrome rồi bấm Tiếp tục.",
     TOKEN_UNAVAILABLE: "Chưa lấy được token Ads Manager. Mở https://adsmanager.facebook.com một lần trên Chrome rồi bấm Tiếp tục.",
-    RATE_LIMITED: "Facebook đang giới hạn tốc độ. Chờ vài phút rồi bấm Tiếp tục (các TKQC chưa xong được giữ nguyên trong hàng đợi).",
+    RATE_LIMITED: "Facebook vẫn đang giới hạn tốc độ dù đã tự chờ và thử lại. Chờ vài phút rồi bấm Tiếp tục (các TKQC chưa xong được giữ nguyên trong hàng đợi).",
     EXTENSION_RESTARTED: "Extension vừa khởi động lại giữa chừng. Bấm Tiếp tục để chạy các TKQC chưa xong (TKQC đã xong không chạy lại).",
     CONTROLLER_ERROR: "Hệ thống gặp lỗi nội bộ. Bấm Tiếp tục để thử lại các TKQC chưa xong."
   },
@@ -115,7 +115,7 @@ const AmitSuperShare = {
     $("queueStat").textContent = `Chờ: ${pending}`;
 
     const stateText = {
-      RUNNING: "Đang thực hiện",
+      RUNNING: batch.backoff ? this.backoffText(batch.backoff) : "Đang thực hiện",
       PAUSED: `Tạm dừng — ${this.PAUSE_TEXT[batch.pause_reason] ? "" : (batch.pause_reason || "")}`.replace(/ — $/, ""),
       FINISHED: this.finalSummary(batch)
     };
@@ -139,6 +139,12 @@ const AmitSuperShare = {
       this.onBatchFinished(batch);
     }
     this.validateAction();
+  },
+
+  /** Graph engine đang chờ Facebook hết giới hạn tốc độ rồi tự chạy lại TKQC (docx kiến trúc §10.2). */
+  backoffText(b) {
+    const s = Math.max(0, Math.ceil((Date.parse(b.until) - Date.now()) / 1000));
+    return `Facebook đang giới hạn tốc độ. Tự thử lại TKQC ${b.ad_account_id} sau ${s} giây (lần ${b.attempt}/${b.max})`;
   },
 
   /** Docx §31/§54: hiển thị số thực tế, không cần nhãn PARTIAL_SUCCESS. */
@@ -643,8 +649,8 @@ const AmitSuperShare = {
         return;
       }
 
-      // Docx §51: một CTA duy nhất, không có bước xác nhận thứ hai.
-      this.startExecution();
+      // Docx §51: một CTA duy nhất. Riêng Graph engine + action xóa theo state: xem trước và xác nhận kế hoạch (docx kiến trúc §7.3).
+      this.executeWithPreview();
     };
 
     // Tab switcher
@@ -763,16 +769,150 @@ const AmitSuperShare = {
   },
 
   // ==========================================
+  // 4a. XEM TRƯỚC KẾ HOẠCH XÓA (Graph engine; docx kiến trúc §7.3, §11.2)
+  // ==========================================
+  PREVIEW_CHUNK: 10, // mỗi lần gọi extension; chia nhỏ để service worker không bị tắt giữa chừng
+  _previewing: false,
+
+  ROLE_LABEL: { ADMIN: "Quản trị viên", ADVERTISER: "Nhà quảng cáo", ANALYST: "Nhà phân tích" },
+
+  /**
+   * Graph engine: 3 action xóa theo state (và REMOVE_SELF) phải được xem trước + xác nhận rồi mới chạy.
+   * DOM engine không đọc được state nếu không mở Ads Manager nên giữ luồng một CTA của docx gốc (§51).
+   */
+  async executeWithPreview() {
+    const def = AmitSuperShareCore.ACTION_DEFS[this.currentAction];
+    if (!(def && def.preview) || !AmitBridge.isExtensionAvailable) return this.startExecution();
+    const eng = await AmitBridge.sendMessage("get_super_share_engine");
+    if (!(eng && eng.ok && eng.engine === "graph")) return this.startExecution();
+    if (this._previewing) return;
+
+    const req = this.buildRequest([...this.selectedAccounts]);
+    const missing = req.items.filter(i => !i.executor_uid);
+    if (missing.length) {
+      AmitApp.toast(`⚠️ ${missing.length} TKQC chưa có UID của Via thực thi. Bấm Sync ở Ads Check để cập nhật rồi thử lại.`);
+      return;
+    }
+
+    this._previewing = true;
+    try {
+      const previews = [];
+      for (let i = 0; i < req.items.length; i += this.PREVIEW_CHUNK) {
+        this.setPreviewProgress(previews.length, req.items.length);
+        const res = await AmitBridge.sendMessage("super_share_preview", { items: req.items.slice(i, i + this.PREVIEW_CHUNK) });
+        if (!res || !res.success) {
+          AmitApp.log("warn", "preview.failed", { error: res && res.error });
+          AmitApp.toast(`⚠️ Không xem trước được: ${res && (res.message || res.error) ? (res.message || res.error) : "Extension không phản hồi."}`);
+          return;
+        }
+        previews.push(...res.previews);
+        if (!res.complete) break; // gặp PAUSED: không đọc tiếp khi Facebook đang chặn
+      }
+      const paused = previews.find(p => p.status === "PAUSED");
+      if (paused) {
+        AmitApp.log("warn", "preview.paused", { error_code: paused.error_code, read: previews.length, total: req.items.length });
+        AmitApp.toast(`⚠️ ${this.PAUSE_TEXT[paused.error_code] || paused.error_message} (đã dừng xem trước, chưa có gì bị thay đổi).`);
+        return;
+      }
+      AmitApp.log("info", "preview.done", {
+        action: this.currentAction, accounts: previews.length,
+        ok: previews.filter(p => p.status === "OK").length, blocked: previews.filter(p => p.status === "BLOCKED").length,
+        error: previews.filter(p => p.status === "ERROR").length, to_remove: previews.reduce((n, p) => n + p.remove_uids.length, 0)
+      });
+      this.showPreview(previews, req);
+    } finally {
+      this._previewing = false;
+      this.setPreviewProgress(null);
+    }
+  },
+
+  setPreviewProgress(done, total) {
+    const hint = document.getElementById("configHint");
+    if (!hint) return;
+    if (done === null) { this.validateAction(); return; }
+    hint.textContent = `Đang đọc danh sách người dùng để lập kế hoạch… ${done}/${total}`;
+    hint.style.color = "#777";
+  },
+
+  /** Modal kế hoạch: người dùng thấy CHÍNH XÁC ai sẽ bị xóa ở từng TKQC rồi mới xác nhận. */
+  showPreview(previews, req) {
+    const runnable = previews.filter(p => p.snapshot); // OK + BLOCKED (BLOCKED vẫn chạy để ghi lỗi tường minh vào lịch sử)
+    const skipped = previews.filter(p => !p.snapshot);
+    const okPlans = previews.filter(p => p.status === "OK");
+    const totalRemove = okPlans.reduce((n, p) => n + p.remove_uids.length, 0);
+    const isSelf = this.currentAction === "REMOVE_SELF";
+    const e = s => this.esc(s);
+    const who = u => `${u.name ? e(u.name) + " " : ""}<span style="color:#888">(${e(u.uid)}${u.role ? ", " + e(this.ROLE_LABEL[u.role] || u.role) : ""})</span>`;
+
+    const rows = previews.map(p => {
+      let result, detail = "";
+      if (p.status === "OK") {
+        const gone = p.users.filter(u => u.mark === "REMOVE");
+        result = p.remove_uids.length
+          ? `<span style="color:#de350b;font-weight:600">${isSelf ? "Gỡ chính Via" : `Xóa ${p.remove_uids.length} người`}</span>`
+          : `<span style="color:#00875a">Không có gì để xóa</span>`;
+        detail = gone.slice(0, 8).map(u => `<div>– ${who(u)}</div>`).join("") + (gone.length > 8 ? `<div style="color:#888">…và ${gone.length - 8} người khác</div>` : "");
+        const kept = p.users.filter(u => u.mark !== "REMOVE");
+        detail += `<div style="color:#888;margin-top:2px">Giữ lại ${kept.length}: ${kept.slice(0, 6).map(u => e(u.uid) + (u.mark === "SELF" ? " (Via này)" : u.mark === "OWNER" ? " (chủ sở hữu)" : "")).join(", ")}${kept.length > 6 ? "…" : ""}</div>`;
+        if (isSelf) detail += `<div style="color:#b35c00">Via này sẽ <b>mất quyền truy cập</b> TKQC${p.other_admins !== null ? ` (còn ${p.other_admins} Quản trị viên khác)` : ""}.</div>`;
+      } else if (p.status === "BLOCKED") {
+        result = `<span style="color:#d32f2f;font-weight:600">Bị chặn</span>`;
+        detail = `<code>${e(p.error_code)}</code> — ${e(p.error_message)}<div style="color:#888">Sẽ ghi thất bại, không ai bị xóa.</div>`;
+      } else {
+        result = `<span style="color:#b35c00;font-weight:600">Bỏ qua</span>`;
+        detail = `<code>${e(p.error_code)}</code> — ${e(p.error_message)}<div style="color:#888">Không đọc được danh sách người dùng nên không chạy TKQC này.</div>`;
+      }
+      return `<tr style="border-bottom:1px solid #eee;vertical-align:top">
+        <td style="padding:6px"><b>${e(p.ad_account_id)}</b></td><td style="padding:6px;white-space:nowrap">${result}</td><td style="padding:6px">${detail}</td></tr>`;
+    }).join("");
+
+    const html = `
+      <div style="line-height:1.55;font-size:13px">
+        <div style="padding:8px 10px;border-radius:6px;background:#fff4e5;border:1px solid #ffd59a;margin-bottom:10px">
+          ${isSelf ? "<b>Gỡ quyền chính Via thực thi.</b> " : ""}Sẽ xóa tổng cộng <b style="color:#de350b">${totalRemove}</b> người ở <b>${okPlans.filter(p => p.remove_uids.length).length}</b> TKQC.
+          Thao tác này <b>không hoàn tác được</b>.
+        </div>
+        <div class="hint" style="margin-bottom:8px">
+          ${runnable.length} TKQC sẽ chạy${skipped.length ? ` · <span style="color:#b35c00">${skipped.length} TKQC bỏ qua</span>` : ""}.
+          Kế hoạch có hiệu lực ${Math.round(AmitSuperShareCore.SNAPSHOT_TTL_MS / 60000)} phút. Nếu danh sách người dùng của một TKQC thay đổi trước khi chạy tới nó,
+          TKQC đó sẽ dừng với mã <code>SNAPSHOT_CHANGED</code> và không ai bị xóa.
+        </div>
+        <div style="max-height:340px;overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead><tr style="text-align:left;color:#707070"><th style="padding:4px 6px">TKQC</th><th style="padding:4px 6px">Kế hoạch</th><th style="padding:4px 6px">Chi tiết</th></tr></thead>
+          <tbody>${rows}</tbody></table></div>
+      </div>`;
+
+    if (!runnable.length) {
+      AmitApp.openModal("Kế hoạch xóa — không có TKQC nào chạy được", html);
+      return;
+    }
+    const items = req.items.filter(i => runnable.some(p => p.ad_account_id === i.ad_account_id))
+      .map(i => Object.assign({}, i, { snapshot: runnable.find(p => p.ad_account_id === i.ad_account_id).snapshot }));
+    AmitApp.openModal(
+      isSelf ? "Xác nhận gỡ quyền chính Via" : "Xác nhận kế hoạch xóa",
+      html,
+      () => this.startExecution({ req: { items, delay_seconds: req.delay_seconds }, skipped: skipped.map(p => p.ad_account_id) }),
+      `Xác nhận và thực hiện (${runnable.length} TKQC)`
+    );
+  },
+
+  // ==========================================
   // 4. EXECUTION (do Extension chạy)
   // ==========================================
-  async startExecution() {
+  /** opts.req: request đã dựng và đã xem trước (kèm snapshot); opts.skipped: TKQC không xem trước được nên không chạy. */
+  async startExecution(opts) {
+    opts = opts || {};
     if (!AmitBridge.isExtensionAvailable) {
       AmitApp.toast("⚠️ Chưa kết nối AMIT Extension nên không thể thực hiện. Vui lòng mở Web từ extension đã cài.");
       return;
     }
 
-    const ids = [...this.selectedAccounts];
-    const req = this.buildRequest(ids);
+    const req = opts.req || this.buildRequest([...this.selectedAccounts]);
+    const ids = req.items.map(i => i.ad_account_id);
+    (opts.skipped || []).forEach(id => {
+      const pEl = document.getElementById(`progress-${id}`);
+      if (pEl) { pEl.textContent = "Bỏ qua (không xem trước được)"; pEl.style.color = "#b35c00"; }
+    });
     AmitApp.log("info", "execute.request", { action: this.currentAction, accounts: ids.length, delay_seconds: req.delay_seconds,
       without_executor_uid: req.items.filter(i => !i.executor_uid).length, sample: req.items.slice(0, 3) });
 

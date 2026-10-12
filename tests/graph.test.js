@@ -357,6 +357,105 @@ const roleOf = (fb, act, uid) => { const u = fb.acts[act].users.get(uid); return
   }
 
   // =========================================================
+  // 5b. XEM TRƯỚC + SNAPSHOT cho thao tác xóa (docx kiến trúc §7.3, §11.2)
+  // =========================================================
+  {
+    const mk = () => { const fb = world(); fb.addUser("100", "900", 1001); fb.addUser("100", "5", 1002); fb.addUser("100", "6", 1003); return fb; };
+    const removeAll = extra => item("100", Object.assign({ action: "REMOVE_ALL_EXCEPT_SELF", target_uids: [], role: null }, extra || {}));
+    const preview = (b, itm) => b.ctx.AmitPermissionService.previewItem(b.deps, itm);
+    const agoIso = ms => new Date(Date.now() - ms).toISOString();
+
+    const fb = mk(); const b = build(fb);
+    const pv = await preview(b, removeAll());
+    const mark = uid => (pv.users.find(u => u.uid === uid) || {}).mark;
+    ok("preview: kế hoạch xóa 5 và 6, giữ self (1) và owner (900); chỉ GET, không ghi gì", pv.status === "OK" && pv.remove_uids.join() === "5,6" && pv.keep_uids.includes("1") && pv.keep_uids.includes("900") && posts(fb).length === 0, pv);
+    ok("preview: đánh dấu REMOVE / SELF / OWNER cho từng dòng", mark("5") === "REMOVE" && mark("6") === "REMOVE" && mark("1") === "SELF" && mark("900") === "OWNER", pv.users);
+    ok("preview: snapshot có created_at, owner, danh sách xóa; KHÔNG chứa tên hay token", pv.snapshot && pv.snapshot.owner_id === "900" && pv.snapshot.remove_uids.join() === "5,6" && !isNaN(Date.parse(pv.snapshot.created_at)) && !/User \d|name/.test(JSON.stringify(pv.snapshot)) && !JSON.stringify([pv, b.logs]).includes(TOKEN), pv.snapshot);
+
+    // chạy với snapshot khớp
+    const r1 = await b.run(removeAll({ snapshot: pv.snapshot }));
+    ok("snapshot khớp -> xóa đúng 5 và 6, SUCCESS", r1.status === "SUCCESS" && !fb.acts["100"].users.has("5") && !fb.acts["100"].users.has("6") && fb.acts["100"].users.has("1") && fb.acts["100"].users.has("900"), [...fb.acts["100"].users.keys()]);
+
+    // state đổi: có người mới xuất hiện sau khi xem trước
+    const fb2 = mk(); const b2 = build(fb2);
+    const pv2 = await preview(b2, removeAll());
+    fb2.addUser("100", "7", 1002);
+    const r2 = await b2.run(removeAll({ snapshot: pv2.snapshot }));
+    ok("snapshot: có UID mới (7) chưa từng được xem trước -> SNAPSHOT_CHANGED, KHÔNG xóa ai", r2.status === "FAILED" && r2.error_code === "SNAPSHOT_CHANGED" && /7/.test(r2.error_message) && posts(fb2).length === 0 && fb2.acts["100"].users.has("5"), r2);
+    ok("snapshot: SNAPSHOT_CHANGED không retry được (phải xem trước lại)", r2.retryable === false);
+
+    // ít người hơn lúc xem trước thì vẫn an toàn
+    const fb3 = mk(); const b3 = build(fb3);
+    const pv3 = await preview(b3, removeAll());
+    fb3.acts["100"].users.delete("6");
+    const r3 = await b3.run(removeAll({ snapshot: pv3.snapshot }));
+    ok("snapshot: một UID đã tự biến mất -> chỉ xóa phần còn lại, SUCCESS", r3.status === "SUCCESS" && !fb3.acts["100"].users.has("5") && posts(fb3).length === 1, { s: r3.status, posts: posts(fb3).length });
+
+    // hết hạn / giả mạo thời gian
+    const fb4 = mk(); const b4 = build(fb4);
+    const pv4 = await preview(b4, removeAll());
+    const r4 = await b4.run(removeAll({ snapshot: Object.assign({}, pv4.snapshot, { created_at: agoIso(45 * 60 * 1000) }) }));
+    ok("snapshot quá 30 phút -> SNAPSHOT_EXPIRED, KHÔNG xóa ai", r4.error_code === "SNAPSHOT_EXPIRED" && posts(fb4).length === 0 && r4.retryable === false, r4);
+    const r5 = await b4.run(removeAll({ snapshot: Object.assign({}, pv4.snapshot, { created_at: "2999-01-01T00:00:00.000Z" }) }));
+    ok("snapshot có thời gian ở tương lai -> SNAPSHOT_EXPIRED", r5.error_code === "SNAPSHOT_EXPIRED" && posts(fb4).length === 0, r5.error_code);
+    const r6 = await b4.run(removeAll({ snapshot: Object.assign({}, pv4.snapshot, { created_at: "không phải ngày" }) }));
+    ok("snapshot có created_at rác -> SNAPSHOT_EXPIRED", r6.error_code === "SNAPSHOT_EXPIRED" && posts(fb4).length === 0);
+    const r7 = await b4.run(removeAll({ snapshot: Object.assign({}, pv4.snapshot, { executor_uid: "2" }) }));
+    ok("snapshot lập cho Via khác -> SNAPSHOT_CHANGED", r7.error_code === "SNAPSHOT_CHANGED" && posts(fb4).length === 0, r7.error_code);
+
+    // snapshot rỗng + không có gì để xóa không bị coi là lỗi
+    const fb5 = world(); const b5 = build(fb5);
+    const pv5 = await preview(b5, removeAll());
+    const r8 = await b5.run(removeAll({ snapshot: Object.assign({}, pv5.snapshot, { created_at: agoIso(45 * 60 * 1000) }) }));
+    ok("không có gì để xóa -> NO_ACTION_REQUIRED dù snapshot cũ", r8.status === "SUCCESS" && r8.note === "NO_ACTION_REQUIRED" && pv5.remove_uids.length === 0, r8);
+
+    // keep-list
+    const fb6 = mk(); const b6 = build(fb6);
+    const pk = await preview(b6, removeAll({ action: "REMOVE_ALL_EXCEPT_UIDS_AND_SELF", target_uids: ["5"] }));
+    ok("preview keep-list: giữ 5, xóa 6", pk.status === "OK" && pk.remove_uids.join() === "6" && pk.keep_uids.includes("5"), pk);
+    const pk2 = await preview(b6, removeAll({ action: "REMOVE_ALL_EXCEPT_UIDS_AND_SELF", target_uids: ["999"] }));
+    ok("preview keep-list: UID giữ không tồn tại -> BLOCKED KEEP_UID_NOT_FOUND, không xóa ai", pk2.status === "BLOCKED" && pk2.error_code === "KEEP_UID_NOT_FOUND" && pk2.remove_uids.length === 0 && !!pk2.snapshot, pk2);
+
+    // REMOVE_SELF
+    const fb7 = world(); fb7.addUser("100", "7", 1001); const b7 = build(fb7);
+    const ps = await preview(b7, item("100", { action: "REMOVE_SELF", target_uids: [], role: null }));
+    ok("preview REMOVE_SELF: xóa chính Via (1), còn 1 admin khác", ps.status === "OK" && ps.remove_uids.join() === "1" && ps.other_admins === 1 && ps.users.find(u => u.uid === "1").mark === "REMOVE", ps);
+    const rs = await b7.run(item("100", { action: "REMOVE_SELF", target_uids: [], role: null, snapshot: Object.assign({}, ps.snapshot, { created_at: agoIso(45 * 60 * 1000) }) }));
+    ok("REMOVE_SELF với snapshot hết hạn -> SNAPSHOT_EXPIRED, KHÔNG gỡ", rs.error_code === "SNAPSHOT_EXPIRED" && posts(fb7).length === 0 && fb7.acts["100"].users.has("1"), rs);
+    const fb8 = world(); const b8 = build(fb8);
+    const ps2 = await preview(b8, item("100", { action: "REMOVE_SELF", target_uids: [], role: null }));
+    ok("preview REMOVE_SELF: không còn admin khác -> BLOCKED NO_OTHER_ADMIN", ps2.status === "BLOCKED" && ps2.error_code === "NO_OTHER_ADMIN" && ps2.remove_uids.length === 0, ps2);
+    const fb9 = world(); fb9.acts["100"].owner = "1"; fb9.addUser("100", "7", 1001); const b9 = build(fb9);
+    const ps3 = await preview(b9, item("100", { action: "REMOVE_SELF", target_uids: [], role: null }));
+    ok("preview REMOVE_SELF: executor là owner -> BLOCKED OWNER_PROTECTED", ps3.status === "BLOCKED" && ps3.error_code === "OWNER_PROTECTED", ps3);
+
+    // lỗi khi xem trước
+    const fbA = world(); fbA.act("300", { denied: true }); const bA = build(fbA);
+    const pa = await preview(bA, removeAll({ ad_account_id: "300" }));
+    ok("preview: TKQC không truy cập được -> ERROR, không có snapshot", pa.status === "ERROR" && !!pa.error_code && pa.snapshot === null, pa);
+    const fbB = world(); fbB.pageRedirect = "https://www.facebook.com/checkpoint/1/"; const bB = build(fbB);
+    const pb = await preview(bB, removeAll());
+    ok("preview: checkpoint -> PAUSED FACEBOOK_CHECKPOINT", pb.status === "PAUSED" && pb.error_code === "FACEBOOK_CHECKPOINT", pb);
+    const pc = await preview(build(world()), removeAll({ executor_uid: "2" }));
+    ok("preview: executor khác chủ token -> ERROR EXECUTOR_IDENTITY_MISMATCH", pc.status === "ERROR" && pc.error_code === "EXECUTOR_IDENTITY_MISMATCH", pc);
+    const pd = await preview(build(world()), item("100"));
+    ok("preview: action không cần xem trước (SHARE_USER) bị từ chối", pd.status === "ERROR" && pd.error_code === "INVALID_INPUT", pd);
+
+    // snapshot là dữ liệu không tin cậy: được làm sạch
+    const SS = load().AmitSuperShareCore;
+    const n = SS.normalizeItem(removeAll({ snapshot: { created_at: "x", users: [{ uid: "abc" }, { uid: "5", role: "admin<script>", via: "users" }], remove_uids: ["5", "<b>", "6"], keep_uids: "oops", evil: 1 } }));
+    ok("snapshot từ Web được làm sạch (chỉ UID số, role hợp lệ, bỏ trường lạ)", n.snapshot.remove_uids.join() === "5,6" && n.snapshot.users.length === 1 && n.snapshot.users[0].role === null && n.snapshot.keep_uids.length === 0 && !("evil" in n.snapshot), n.snapshot);
+    ok("snapshot bị bỏ với action không phải xóa theo state", SS.normalizeItem(item("100", { snapshot: { remove_uids: ["5"] } })).snapshot === null);
+    ok("needsPreview: chỉ 3 action xóa theo state mà chưa có snapshot", SS.needsPreview(SS.normalizeItem(removeAll())) && !SS.needsPreview(SS.normalizeItem(removeAll({ snapshot: pv.snapshot }))) && !SS.needsPreview(SS.normalizeItem(item("100"))) && !SS.needsPreview(SS.normalizeItem(item("100", { action: "REMOVE_BY_UID_EXCEPT_SELF" }))));
+
+    // retry giữ snapshot đã xác nhận
+    const bt = SS.newBatch({ items: [removeAll({ snapshot: pv.snapshot })] }, "b", "t");
+    bt.items[0].status = "FAILED"; bt.items[0].error_code = "NETWORK_ERROR"; bt.items[0].retryable = true;
+    const rt = SS.buildRetryItems(bt);
+    ok("retry giữ snapshot đã xác nhận (không bỏ qua bước xem trước)", rt.length === 1 && rt[0].snapshot && rt[0].snapshot.remove_uids.join() === "5,6", rt);
+  }
+
+  // =========================================================
   // 6. BATCH CONTROLLER + MESSAGE HANDLER với engine = graph
   // =========================================================
   {
@@ -376,6 +475,8 @@ const roleOf = (fb, act, uid) => { const u = fb.acts[act].users.get(uid); return
     const ctx = load({ chrome, fetch: fb.fetch });
     ctx.getFacebookCookie = async () => fb.cookieUid;
     ctx.resolveFacebookSession = async () => null;
+    vm.runInContext(src("shared/metrics.js"), ctx, { filename: "metrics.js" });
+    vm.runInContext(src("extension/services/metrics-service.js"), ctx, { filename: "metrics-service.js" });
     vm.runInContext(src("extension/services/permission-message-handler.js"), ctx, { filename: "permission-message-handler.js" });
     vm.runInContext(src("extension/batch-controller.js"), ctx, { filename: "batch-controller.js" });
     vm.runInContext("graphDelayMs = () => 5;", ctx);
@@ -400,15 +501,197 @@ const roleOf = (fb, act, uid) => { const u = fb.acts[act].users.get(uid); return
     ok("controller graph: không rò token vào batch đã lưu", !JSON.stringify(store).includes(TOKEN));
 
     // pause khi rate limit, resume chạy tiếp
+    // backoff tự động chạy lại 2 lần (rất ngắn trong test) rồi mới PAUSED
+    vm.runInContext("Object.assign(SS_RATE_BACKOFF, { maxAttempts: 2, baseMs: 2, minMs: 1, maxMs: 50 })", ctx);
     const fb2 = fb; let limited = true;
     fb2.hook(c => c.method === "POST" && limited, () => fb2.gerr(17, "User request limit reached", 400), false);
     const r2 = await ctx.startBatch({ items: [item("100", { target_uids: ["20"] }), item("200", { target_uids: ["21"] })], delay_seconds: 3 });
     const paused = await waitDone();
-    ok("controller graph: RATE_LIMITED -> batch PAUSED, TKQC sau chưa chạy", paused.status === "PAUSED" && paused.pause_reason === "RATE_LIMITED" && paused.items[1].status === "PENDING", { s: paused.status, r: paused.pause_reason, i: paused.items.map(i => i.status) });
+    ok("controller graph: RATE_LIMITED kéo dài (hết 2 lần backoff) -> batch PAUSED, TKQC sau chưa chạy, đã thử 1+2 lần", paused.status === "PAUSED" && paused.pause_reason === "RATE_LIMITED" && paused.items[1].status === "PENDING" && !paused.backoff && fb2.calls.filter(c => c.method === "POST" && c.params.uid === "20").length === 3, { s: paused.status, r: paused.pause_reason, i: paused.items.map(i => i.status) });
     limited = false;
     const rr = await ctx.resumeBatch();
     const fin = await waitDone();
     ok("controller graph: Tiếp tục sau rate limit -> hoàn tất cả 2 TKQC", rr.success && fin.status === "FINISHED" && fin.success === 2, { s: fin.status, i: fin.items.map(i => i.status) });
+
+    // ---- backoff theo Retry-After / lùi cấp số nhân (docx kiến trúc §10.2, §12) ----
+    {
+      vm.runInContext("Object.assign(SS_RATE_BACKOFF, { maxAttempts: 3, baseMs: 30000, minMs: 5000, maxMs: 300000, jitter: 0.2 })", ctx); // giá trị mặc định
+      const fn = n => vm.runInContext(n, ctx);
+      const rateMs = fn("rateBackoffMs"), waitMs = fn("rateBackoffWaitMs");
+      const within = (v, lo, hi) => v >= lo && v <= hi;
+      ok("backoff: không có Retry-After -> 30s, 60s, 120s (+ tối đa 20% jitter)", within(rateMs(0), 30000, 36000) && within(rateMs(1), 60000, 72000) && within(rateMs(2), 120000, 144000), [rateMs(0), rateMs(1), rateMs(2)]);
+      ok("backoff: tôn trọng Retry-After khi lớn hơn mức mặc định (45s -> >= 45s)", within(rateMs(0, 45000), 45000, 54000), rateMs(0, 45000));
+      ok("backoff: không vượt trần 5 phút", rateMs(5) <= 300000);
+      const gb = { engine: "graph" }, limited = { status: "PAUSED", error_code: "RATE_LIMITED", detail: {} };
+      ok("backoff: RATE_LIMITED trên Graph -> có chờ", typeof waitMs(gb, limited, 0) === "number");
+      ok("backoff: hết số lần (3) -> null (PAUSED chờ người dùng)", waitMs(gb, limited, 3) === null && typeof waitMs(gb, limited, 2) === "number");
+      ok("backoff: Retry-After > 5 phút -> không đứng chờ, PAUSED ngay", waitMs(gb, { status: "PAUSED", error_code: "RATE_LIMITED", detail: { retry_after_ms: 600000 } }, 0) === null);
+      ok("backoff: chỉ cho rate limit trên Graph (checkpoint, DOM engine, lỗi khác đều không)", waitMs(gb, { status: "PAUSED", error_code: "FACEBOOK_CHECKPOINT" }, 0) === null && waitMs({ engine: "dom" }, limited, 0) === null && waitMs(gb, { status: "FAILED", error_code: "RATE_LIMITED" }, 0) === null);
+    }
+    vm.runInContext("Object.assign(SS_RATE_BACKOFF, { maxAttempts: 2, baseMs: 2, minMs: 1, maxMs: 50 })", ctx); // test nhanh
+
+    // tự hồi phục: bị giới hạn 1 lần rồi chạy được, không PAUSED, không cần bấm Tiếp tục
+    {
+      const fbR = fb; let n = 0;
+      fbR.hook(c => c.method === "POST" && c.path === "/act_100/users" && n++ < 1, () => fbR.gerr(17, "User request limit reached", 400), false);
+      await ctx.startBatch({ items: [item("100", { target_uids: ["41"] }), item("200", { target_uids: ["42"], role: "ANALYST" })], delay_seconds: 3 });
+      const doneR = await waitDone();
+      ok("controller graph: rate limit 1 lần -> tự chờ rồi chạy lại, FINISHED 2/2, không PAUSED", doneR.status === "FINISHED" && doneR.success === 2 && doneR.failed === 0 && doneR.backoff === null, { s: doneR.status, ok: doneR.success, i: doneR.items.map(i => i.status), backoff: doneR.backoff });
+      ok("controller graph: TKQC bị giới hạn được gửi lại đúng 1 lần và kết quả thật sự đã ghi", fbR.calls.filter(c => c.method === "POST" && c.path === "/act_100/users" && c.params.uid === "41").length === 2 && roleOf(fbR, "100", "41") === 1001 && roleOf(fbR, "200", "42") === 1003);
+      fbR.hooks.length = 0;
+    }
+
+    // trong lúc chờ, batch vẫn RUNNING và có thông tin backoff cho Web hiển thị
+    {
+      vm.runInContext("Object.assign(SS_RATE_BACKOFF, { baseMs: 400, minMs: 400, maxMs: 2000 })", ctx);
+      const fbR = fb; let n = 0;
+      fbR.hook(c => c.method === "POST" && c.path === "/act_100/users" && n++ < 1, () => fbR.gerr(17, "User request limit reached", 400), false);
+      await ctx.startBatch({ items: [item("100", { target_uids: ["43"] })], delay_seconds: 3 });
+      let seen = null; const end = Date.now() + 3000;
+      while (Date.now() < end && !seen) { const bt = batch(); if (bt && bt.backoff) seen = { status: bt.status, backoff: bt.backoff, stored: JSON.stringify(store.amit_batch_current && store.amit_batch_current.backoff) }; await sleep(20); }
+      ok("controller graph: đang chờ backoff -> status RUNNING, backoff {lần 1/2, wait_ms, until} được lưu và phát cho Web", seen && seen.status === "RUNNING" && seen.backoff.attempt === 1 && seen.backoff.max === 2 && seen.backoff.wait_ms >= 400 && !isNaN(Date.parse(seen.backoff.until)) && /attempt/.test(seen.stored), seen);
+      const doneW = await waitDone();
+      ok("controller graph: hết chờ -> backoff xóa, TKQC SUCCESS", doneW.status === "FINISHED" && doneW.success === 1 && doneW.backoff === null, doneW);
+      fbR.hooks.length = 0;
+      vm.runInContext("Object.assign(SS_RATE_BACKOFF, { baseMs: 2, minMs: 1, maxMs: 50 })", ctx);
+    }
+
+    // Retry-After thật từ header được dùng làm mức chờ tối thiểu
+    {
+      const fbR = fb; let n = 0;
+      vm.runInContext("Object.assign(SS_RATE_BACKOFF, { baseMs: 2, minMs: 1, maxMs: 3000 })", ctx);
+      fbR.hook(c => c.method === "POST" && c.path === "/act_100/users" && n++ < 1, () => ({
+        ok: false, status: 429, url: "https://graph.facebook.com/", headers: { get: h => (h === "retry-after" ? "1" : null) }, text: async () => "{}"
+      }), false);
+      const t0 = Date.now();
+      await ctx.startBatch({ items: [item("100", { target_uids: ["44"] })], delay_seconds: 3 });
+      const doneH = await waitDone();
+      ok("controller graph: HTTP 429 + Retry-After: 1 -> chờ >= 1 giây rồi tự chạy lại và thành công", doneH.status === "FINISHED" && doneH.success === 1 && Date.now() - t0 >= 950, { s: doneH.status, ms: Date.now() - t0 });
+      fbR.hooks.length = 0;
+      vm.runInContext("Object.assign(SS_RATE_BACKOFF, { baseMs: 2, minMs: 1, maxMs: 50 })", ctx);
+    }
+
+    // ---- xem trước + xác nhận (docx kiến trúc §7.3, §11.2) ----
+    {
+      const preview = vm.runInContext("handleSuperSharePreview", ctx);
+      [...fb.acts["200"].users.keys()].filter(u => u !== "1").forEach(u => fb.acts["200"].users.delete(u)); // giữ test nhanh: mỗi lần xóa có nghỉ 1-3 giây
+      fb.addUser("200", "55", 1003); fb.addUser("200", "56", 1002);
+      const delItem = extra => item("200", Object.assign({ action: "REMOVE_ALL_EXCEPT_SELF", target_uids: [], role: null }, extra || {}));
+
+      const rej = await ctx.startBatch({ items: [delItem()], delay_seconds: 3 });
+      ok("controller graph: xóa hàng loạt KHÔNG có snapshot -> PREVIEW_REQUIRED, không tạo batch, không gửi gì", rej.success === false && rej.error === "PREVIEW_REQUIRED" && !fb.calls.some(c => c.method === "POST" && c.path === "/act_200/users/55"), rej);
+      const rej2 = await ctx.startBatch({ items: [delItem({ action: "REMOVE_SELF" })], delay_seconds: 3 });
+      ok("controller graph: REMOVE_SELF không có snapshot cũng bị chặn", rej2.success === false && rej2.error === "PREVIEW_REQUIRED");
+      const okNoPrev = await ctx.startBatch({ items: [item("100", { action: "REMOVE_BY_UID_EXCEPT_SELF", target_uids: ["43"], role: null })], delay_seconds: 3 });
+      ok("controller graph: REMOVE_BY_UID (≤3 UID, không phụ thuộc state) không cần xem trước", okNoPrev.success === true);
+      await waitDone();
+
+      const pr = await preview([delItem()]);
+      const p0 = pr.previews && pr.previews[0];
+      ok("super_share_preview: trả kế hoạch (xóa 55, 56, giữ self) mà không ghi gì", pr.success && pr.complete && p0.status === "OK" && p0.remove_uids.includes("55") && p0.remove_uids.includes("56") && !p0.remove_uids.includes("1") && !JSON.stringify(pr).includes(TOKEN), pr);
+      const writesBefore = fb.calls.filter(c => c.method === "POST").length;
+      await preview([delItem()]);
+      ok("super_share_preview: chỉ GET", fb.calls.filter(c => c.method === "POST").length === writesBefore);
+
+      const run = await ctx.startBatch({ items: [delItem({ snapshot: p0.snapshot })], delay_seconds: 3 });
+      ok("controller graph: có snapshot đã xem trước -> batch được nhận", run.success === true, run);
+      const doneP = await waitDone();
+      ok("controller graph: xóa đúng danh sách đã xem trước, giữ self; snapshot không chứa token", doneP.status === "FINISHED" && doneP.success === 1 && !fb.acts["200"].users.has("55") && !fb.acts["200"].users.has("56") && fb.acts["200"].users.has("1") && !JSON.stringify(store).includes(TOKEN), { s: doneP.status, users: [...fb.acts["200"].users.keys()] });
+
+      fb.addUser("200", "57", 1003);
+      const p1 = (await preview([delItem()])).previews[0];
+      fb.addUser("200", "58", 1003); // xuất hiện SAU khi người dùng đã xem trước
+      await ctx.startBatch({ items: [delItem({ snapshot: p1.snapshot })], delay_seconds: 3 });
+      const doneC = await waitDone();
+      ok("controller graph: state đổi sau khi xem trước -> FAILED SNAPSHOT_CHANGED, không ai bị xóa", doneC.status === "FINISHED" && doneC.failed === 1 && doneC.items[0].error_code === "SNAPSHOT_CHANGED" && fb.acts["200"].users.has("57") && fb.acts["200"].users.has("58"), { i: doneC.items[0].error_code });
+      ok("controller graph: SNAPSHOT_CHANGED không nằm trong danh sách Retry", ctx.AmitSuperShareCore.buildRetryItems(doneC).length === 0);
+
+      // giới hạn của handler
+      const tooMany = await preview(Array.from({ length: 21 }, (_, i) => delItem({ ad_account_id: String(1000 + i) })));
+      ok("super_share_preview: quá 20 TKQC mỗi lần -> INVALID_INPUT", tooMany.success === false && tooMany.error === "INVALID_INPUT");
+      const wrongAct = await preview([item("200")]);
+      ok("super_share_preview: SHARE_USER không cần xem trước -> INVALID_INPUT", wrongAct.success === false && wrongAct.error === "INVALID_INPUT");
+      const none = await preview([]);
+      ok("super_share_preview: rỗng -> INVALID_INPUT", none.success === false);
+
+      // pause giữa chừng: dừng đọc tiếp
+      fb.hook(c => c.method === "GET" && c.path === "/act_200", () => fb.gerr(190, "Checkpoint required", 400, 459), true);
+      const pz = await preview([delItem(), delItem({ ad_account_id: "100" })]);
+      ok("super_share_preview: checkpoint -> dừng ngay (complete=false), không đọc TKQC sau", pz.success && pz.complete === false && pz.previews.length === 1 && pz.previews[0].status === "PAUSED" && pz.previews[0].error_code === "FACEBOOK_CHECKPOINT", pz);
+
+      // DOM engine không xem trước được
+      await vm.runInContext("setSuperShareEngine('dom')", ctx);
+      const pdom = await preview([delItem()]);
+      ok("super_share_preview: DOM engine -> ENGINE_NOT_GRAPH", pdom.success === false && pdom.error === "ENGINE_NOT_GRAPH", pdom);
+      await vm.runInContext("setSuperShareEngine('graph')", ctx);
+    }
+
+    // ---- số liệu nghiệm thu AC10 / AC11 + chỉ số vận hành (docx kiến trúc §17, §18.1) ----
+    {
+      const getSnap = () => vm.runInContext("AmitMetricsRuntime.get().snapshot()", ctx);
+      const snap = await getSnap();
+      const gt = snap.targets.filter(r => r.engine === "graph");
+      ok("metrics: mỗi TKQC xong ghi bản ghi target (engine graph, verify_state, method, thời gian)", gt.length > 5 && gt.some(r => r.verify_state === "MATCH" && r.method_used === "USERS" && r.status === "SUCCESS" && r.target_ms >= 0 && r.item_ms >= 0), gt.slice(0, 2));
+      ok("metrics: KHÔNG ghi token / UID / tên; chỉ ID TKQC", !JSON.stringify(snap).includes(TOKEN) && snap.targets.every(r => !("uid" in r) && !("name" in r) && !("error_message" in r)));
+      ok("metrics: request Graph được ghi theo endpoint đã chuẩn hóa (không lộ ID thật)", snap.requests.length > 10 && snap.requests.every(r => !/\d{4,}/.test(r.endpoint)) && snap.requests.some(r => r.endpoint === "/act_{id}/users" && r.method === "POST" && r.mutation && r.ok) && snap.requests.some(r => r.method === "GET" && !r.mutation), snap.requests.slice(0, 3));
+      ok("metrics: request lỗi ghi kèm mã lỗi (RATE_LIMITED từ các bài test trước)", snap.requests.some(r => !r.ok && r.error_code === "RATE_LIMITED"));
+      const ev = n => snap.events.filter(e => e.name === n);
+      ok("metrics: batch_paused ghi lý do RATE_LIMITED; rate_backoff ghi lần thử; token_refresh ghi slot", ev("batch_paused").some(e => e.reason === "RATE_LIMITED") && ev("rate_backoff").some(e => e.attempt === 1) && ev("token_refresh").some(e => e.slot === "token_b"), snap.events.slice(0, 6));
+
+      // thời gian chờ backoff KHÔNG tính vào thời gian xử lý
+      vm.runInContext("Object.assign(SS_RATE_BACKOFF, { maxAttempts: 2, baseMs: 700, minMs: 700, maxMs: 3000, jitter: 0 })", ctx);
+      let hits = 0;
+      fb.hook(c => c.method === "POST" && c.path === "/act_100/users" && hits++ < 1, () => fb.gerr(17, "User request limit reached", 400), false);
+      const tBo = Date.now();
+      await ctx.startBatch({ items: [item("100", { target_uids: ["71"] })], delay_seconds: 3 });
+      await waitDone();
+      const wall = Date.now() - tBo;
+      const lastRec = (await getSnap()).targets.filter(r => r.engine === "graph").slice(-1)[0];
+      // item_ms còn gồm 1 giây settle kỹ thuật sau khi ghi (SETTLE_MS); phần chênh với tổng thời gian chính là ~700ms backoff đã bị trừ
+      ok("metrics: thời gian target không gồm thời gian chờ backoff (tổng - ghi nhận ≈ 700ms)", wall >= 700 && Math.abs((wall - lastRec.item_ms) - 700) < 300, { wall, item_ms: lastRec.item_ms });
+      fb.hooks.length = 0;
+      vm.runInContext("Object.assign(SS_RATE_BACKOFF, { maxAttempts: 2, baseMs: 2, minMs: 1, maxMs: 50, jitter: 0.2 })", ctx);
+
+      // Retry: ghi retry_total theo lớp lỗi + số lần thử; bản ghi Retry bị đánh dấu để không vào mẫu nghiệm thu
+      fb.hook(c => c.method === "POST" && c.path === "/act_100/users" && c.params.uid === "61", () => fb.gerr(100, "Some unexpected failure", 400), false);
+      await ctx.startBatch({ items: [item("100", { target_uids: ["61"] })], delay_seconds: 3 });
+      const failedB = await waitDone();
+      ok("metrics: (chuẩn bị) TKQC lỗi tạm thời FACEBOOK_GRAPH_ERROR, retryable", failedB.failed === 1 && failedB.items[0].error_code === "FACEBOOK_GRAPH_ERROR" && failedB.items[0].retryable === true, failedB.items[0]);
+      fb.hooks.length = 0;
+      const rr2 = await ctx.retryFailed();
+      const retried = await waitDone();
+      const snap2 = await getSnap();
+      ok("metrics: Retry thành công và batch Retry mang attempt = 2", rr2.success && retried.status === "FINISHED" && retried.success === 1 && retried.attempt === 2 && retried.retry_of, { s: retried.status, a: retried.attempt });
+      ok("metrics: retry_total ghi mã lỗi gốc + lần thử 2; bản ghi Retry có is_retry = true", snap2.events.some(e => e.name === "retry" && e.error_code === "FACEBOOK_GRAPH_ERROR" && e.attempt === 2) && snap2.targets.filter(r => r.is_retry).length === 1 && snap2.targets.filter(r => r.is_retry)[0].status === "SUCCESS");
+      const nothing = await ctx.retryFailed();
+      const snap3 = await getSnap();
+      ok("metrics: Retry bị từ chối (không có gì để retry) -> KHÔNG đếm retry_total", nothing.success === false && snap3.events.filter(e => e.name === "retry").length === snap2.events.filter(e => e.name === "retry").length);
+
+      // message handler
+      const g1 = await vm.runInContext("handleGetMetrics", ctx)();
+      ok("get_metrics: có AC10 / AC11 / engines; chưa đặt ngưỡng nên AC10 = NO_THRESHOLD, AC11 thiếu dữ liệu DOM", g1.ok && g1.summary.ac10.status === "NO_THRESHOLD" && g1.summary.ac11.status === "INSUFFICIENT_DATA" && g1.summary.engines.graph.targets > 5 && g1.summary.engines.dom.targets === 0, g1.summary.ac10);
+      const bad = await vm.runInContext("handleSetMetricsConfig", ctx)({ ac10_min_verified_rate: 5 });
+      ok("set_metrics_config: giá trị sai bị từ chối, cấu hình không đổi", bad.ok === false && bad.error === "INVALID_INPUT" && (await vm.runInContext("handleGetMetrics", ctx)()).config.ac10_min_verified_rate === null);
+      const good = await vm.runInContext("handleSetMetricsConfig", ctx)({ ac10_min_verified_rate: 0.9, min_samples: 5 });
+      const g2 = await vm.runInContext("handleGetMetrics", ctx)();
+      ok("set_metrics_config: lưu ngưỡng 90% / 5 mẫu -> AC10 có kết luận PASS hoặc FAIL (không còn NO_THRESHOLD)", good.ok && g2.config.ac10_min_verified_rate === 0.9 && ["PASS", "FAIL"].includes(g2.summary.ac10.status) && g2.summary.ac10.threshold === 0.9, g2.summary.ac10);
+
+      const ex = await vm.runInContext("handleExportMetrics", ctx)();
+      ok("export_metrics: ID TKQC được che, không chứa token", ex.ok && ex.data.targets.every(r => /…/.test(r.ad_account_id) || r.ad_account_id.length <= 6) && !JSON.stringify(ex.data).includes(TOKEN));
+
+      await vm.runInContext("AmitMetricsRuntime.get().flush()", ctx);
+      ok("metrics: số liệu được ghi xuống chrome.storage (sống sót khi service worker khởi động lại), không có token", store.amit_metrics && store.amit_metrics.targets.length > 5 && !JSON.stringify(store.amit_metrics).includes(TOKEN), Object.keys(store));
+
+      // lỗi metrics KHÔNG được làm hỏng batch
+      vm.runInContext("AmitMetricsRuntime.setForTest({ add() { throw new Error('boom'); }, addMany() { return Promise.reject(new Error('boom')); }, snapshot: async () => ({}) })", ctx);
+      await ctx.startBatch({ items: [item("100", { target_uids: ["81"] })], delay_seconds: 3 });
+      const safe = await waitDone();
+      ok("metrics: kho metrics hỏng -> batch vẫn chạy và SUCCESS bình thường", safe.status === "FINISHED" && safe.success === 1 && roleOf(fb, "100", "81") === 1001, safe);
+      vm.runInContext("AmitMetricsRuntime.setForTest(null)", ctx);
+
+      await vm.runInContext("handleClearMetrics", ctx)();
+      ok("clear_metrics: xóa sạch số liệu", (await getSnap()).targets.length === 0 && (await getSnap()).requests.length === 0);
+    }
 
     // permission_execute (lệnh đơn chuẩn)
     const pe = await vm.runInContext("handlePermissionExecute", ctx)({ request_id: "rq1", action: "GRANT", ad_account_id: "100", target_uid: "31", role: "ADVERTISER", executor_uid: "1" });

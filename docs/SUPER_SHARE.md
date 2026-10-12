@@ -184,6 +184,51 @@ Khác biệt hành vi so với DOM (core chỉ đổi khi `driver.engine === "gr
 - **Retry** chỉ gửi lại target lỗi tạm thời hoặc chưa xác minh (`retryable`), bỏ qua lỗi quyền / target không hợp lệ.
 - **Pacing**: 1–3 giây giữa các mutation cùng TKQC, 2–5 giây giữa TKQC (delay người dùng chọn > 5 giây thì tôn trọng); mutation tuần tự.
 - Kết quả từng UID có thêm `request_id`, `method_used`, `verify_state`, `retryable`.
+- **Rate limit tự backoff** (docx §10.2, §12): khi Graph báo giới hạn tốc độ, batch KHÔNG PAUSED ngay mà chờ rồi chạy lại chính TKQC đó
+  (an toàn: core luôn đọc lại state trước khi ghi). Thời gian chờ = `Retry-After` của Facebook nếu có (làm mức tối thiểu), nếu không thì
+  30s → 60s → 120s, cộng tối đa 20% jitter, trần 5 phút. Tối đa 3 lần mỗi TKQC; hết lần thì PAUSED như cũ để bấm "Tiếp tục".
+  `Retry-After` > 5 phút thì không đứng chờ trong service worker mà PAUSED ngay. Trong lúc chờ, `batch.backoff` ({ attempt, max, wait_ms, until })
+  được lưu và Web hiện đếm ngược. Cấu hình ở `SS_RATE_BACKOFF` (`batch-controller.js`). Chỉ Graph engine; checkpoint / login không bao giờ tự thử lại.
+- **Xem trước và xác nhận trước khi xóa** (docx §7.3, §11.2) — chỉ Graph engine, áp dụng cho `REMOVE_ALL_EXCEPT_UIDS_AND_SELF`,
+  `REMOVE_ALL_EXCEPT_SELF`, `REMOVE_SELF` (các action xóa phụ thuộc state; `REMOVE_BY_UID` tối đa 3 UID nên không cần):
+  1. Bấm Thực hiện → Web gọi `super_share_preview` (chỉ GET, chia lô 10 TKQC, dừng ngay khi gặp checkpoint / rate limit) → modal liệt kê
+     từng TKQC: ai bị xóa (tên, UID, vai trò), ai được giữ (Via này, chủ sở hữu, keep-list), TKQC bị luật chặn (`NO_OTHER_ADMIN`,
+     `KEEP_UID_NOT_FOUND`, `OWNER_PROTECTED`...) và TKQC không đọc được (bị bỏ qua, không chạy).
+  2. Mỗi TKQC có **snapshot** {created_at, executor_uid, owner_id, business_id, users (uid, role, via), keep_uids, remove_uids}; không chứa tên hay token.
+  3. Bấm "Xác nhận và thực hiện" → batch chạy kèm snapshot. Extension **vẫn tính lại danh sách xóa từ state thật**; snapshot chỉ để CHẶN:
+     quá 30 phút → `SNAPSHOT_EXPIRED`; có UID sắp bị xóa mà lúc xem trước không có (hoặc Via thực thi khác) → `SNAPSHOT_CHANGED`;
+     cả hai đều không xóa ai và không Retry được (phải xem trước lại). Ít người hơn lúc xem trước thì vẫn an toàn.
+  4. `startBatch` từ chối (`PREVIEW_REQUIRED`) mọi item xóa theo state không có snapshot khi engine là Graph, nên không đường nào bỏ qua được bước xem trước.
+     Snapshot do Web gửi lên là dữ liệu không tin cậy (được làm sạch hình dạng) nhưng không thể làm xóa nhiều hơn state thật.
+  5. Retry giữ nguyên snapshot đã xác nhận. DOM engine không đọc được state nếu không mở Ads Manager nên giữ luồng một CTA của docx gốc (§51).
+
+### Số liệu nghiệm thu AC10 / AC11 và chỉ số vận hành (docx §17, §18.1)
+
+Tự ghi từ mọi batch (cả DOM lẫn Graph), xem ở **trang Log & báo lỗi → "Số liệu nghiệm thu Graph engine"**. Code: `shared/metrics.js` (tính toán, thuần JS),
+`extension/services/metrics-service.js` (ghi từ service worker). Dữ liệu ở `chrome.storage.local.amit_metrics`; **không chứa token, cookie, UID, tên hay nội dung lỗi**,
+chỉ có ID TKQC (cần để ghép "cùng tập TKQC"). Giới hạn: 5000 target, 8000 request, 2000 sự kiện (bỏ bản ghi cũ nhất). Lỗi ghi số liệu không bao giờ làm hỏng batch.
+
+| Tiêu chí | Cách tính | Kết luận |
+|---|---|---|
+| **AC10** | Tỷ lệ xác minh = (target SUCCESS có `verify_state = MATCH`) / (target có đọc lại: MATCH, MISSING, MISMATCH, UNAVAILABLE), chỉ Graph engine. Lỗi trước bước xác minh (input, quyền, danh tính...) đếm riêng, **không** làm giảm tỷ lệ; đọc lại không được (`UNAVAILABLE`) **có** làm giảm. | So với **ngưỡng do đội sản phẩm đặt** (ô "Ngưỡng AC10"; **không có mặc định**, chưa đặt = `NO_THRESHOLD`). |
+| **AC11** | P95 thời gian mỗi target của Graph **<** P95 của DOM, chỉ trên các cặp (TKQC + action) **có ở cả hai engine**, chỉ target SUCCESS. Bằng nhau = FAIL. | `PASS` / `FAIL`. |
+
+- Mỗi bên cần tối thiểu **30 mẫu** (đổi được ở ô "Số mẫu tối thiểu"); thiếu thì `INSUFFICIENT_DATA`, không đoán PASS.
+- **Thời gian mỗi target** = thời gian TKQC chạy xong chia đều cho số target. Gồm: điều hướng + inject (DOM), settle 1 giây sau khi ghi và nghỉ 1–3 giây giữa các UID (Graph).
+  **Không** gồm: chờ backoff rate limit, delay giữa các TKQC. Lần Retry không được tính (đếm riêng).
+- Kết quả PAUSED chưa xong nên không ghi; khi chạy tiếp, kết quả cuối mới được ghi.
+- Chỉ số vận hành đúng tên docx §18.1: `permission_requests_total` (engine, action, role, method, status), `permission_duration_ms` (P50/P95 theo method + endpoint, đã chuẩn hóa `/act_{id}/users`),
+  `permission_verify_total`, `token_refresh_total` (slot, nguồn / `invalidated`), `batch_paused_total` (lý do), `retry_total` (mã lỗi, lần thử), thêm `rate_backoff_total`.
+- File log xuất ra có thêm `metrics` (AC10, AC11, tóm tắt hai engine) trong header. Nút **Xuất số liệu (JSON)** cho đội sản phẩm: ID TKQC đã che ở giữa.
+
+**Quy trình đo để AC11 có nghĩa** (cùng tập TKQC, cùng action, hai engine):
+1. Chọn tập TKQC thử nghiệm (≥ 30), bấm **Xóa số liệu** để bắt đầu đợt đo mới.
+2. Engine **DOM**: chạy `SHARE_USER` (vd role Nhà phân tích) trên cả tập, rồi `REMOVE_BY_UID` cùng UID để trả về trạng thái ban đầu.
+3. Đổi popup sang engine **Graph**, chạy đúng hai bước trên với **đúng tập TKQC đó**.
+4. Đặt ngưỡng AC10 (đội sản phẩm quyết định), bấm Làm mới, đọc AC10 / AC11. Nếu bị rate limit giữa chừng thì kết quả vẫn đúng vì thời gian backoff đã bị trừ.
+
+Lưu ý khi đọc kết quả: đường ghi của Graph có **1 giây settle cố định** (`SETTLE_MS` trong `permission-service.js`) trước khi đọc lại, nên với TKQC chỉ có 1 UID đây là phần lớn thời gian của Graph.
+Đó là mốc đầu tiên để tối ưu nếu AC11 không đạt.
 
 ### Chưa được kiểm chứng trên Facebook thật (đọc trước khi bật cho người dùng)
 
@@ -191,5 +236,6 @@ Khác biệt hành vi so với DOM (core chỉ đổi khi `driver.engine === "gr
 2. Mẫu thông báo nhận ra "target không đủ điều kiện" / "TKQC không tồn tại" trong `error-classifier.js` là suy đoán; mẫu lạ thì không fallback.
 3. Mã lỗi khi tự gỡ chính mình rồi đọc lại (đang coi `INSUFFICIENT_PERMISSION` / `ACCOUNT_NOT_FOUND` là bằng chứng) cần xác nhận bằng log thật.
 4. DNR rule đã thu hẹp về request do chính extension phát (`initiatorDomains`); cần kiểm tra Ads Check (discovery, inspect) vẫn chạy.
-5. Concurrency mutation = 1 mỗi Via; chưa có telemetry tỷ lệ lỗi theo endpoint (log sự kiện `permission.*`, `token.*` đã có, metric tổng hợp chưa làm).
-6. Ngưỡng nghiệm thu AC10 / AC11 (tỷ lệ verify thành công, P95) cần được đội sản phẩm đặt số cụ thể.
+5. Backoff: Graph thường **không** gửi header `Retry-After` (chỉ có `x-app-usage` / `estimated_time_to_regain_access`), nên thực tế đa số là lùi cấp số nhân 30/60/120s; cần log thật để chỉnh `SS_RATE_BACKOFF`. Xem trước tốn thêm ~2-3 GET mỗi TKQC (chưa đo ảnh hưởng tới rate limit với 1000+ TKQC).
+6. Concurrency mutation = 1 mỗi Via; chưa có telemetry tỷ lệ lỗi theo endpoint (log sự kiện `permission.*`, `token.*` đã có, metric tổng hợp chưa làm).
+7. Ngưỡng AC10 (tỷ lệ xác minh thành công) vẫn do đội sản phẩm đặt: code **không** có giá trị mặc định nên AC10 hiện chỉ có thể là `NO_THRESHOLD` / `INSUFFICIENT_DATA` cho tới khi có con số. AC11 không cần ngưỡng nhưng cần chạy thật trên cả hai engine.

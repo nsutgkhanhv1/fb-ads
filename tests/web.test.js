@@ -15,6 +15,8 @@ const scripts = ["shared/constants.js", "shared/super-share-core.js", "web/js/st
   const w = dom.window;
   const sent = [];
   let batchState = null;
+  let engine = "dom";                       // engine do extension báo về (get_super_share_engine)
+  let previewReply = () => ({ success: false }); // trả lời super_share_preview
   w.chrome = {
     runtime: {
       id: "test-ext",
@@ -27,6 +29,8 @@ const scripts = ["shared/constants.js", "shared/super-share-core.js", "web/js/st
             case "ensure_session": case "get_active_session": return { success: true, session: { uid: "100000000000001", userName: "Via Minh" } };
             case "execute_super_share_batch": return handleExec(msg);
             case "resume_batch": return { success: true };
+            case "get_super_share_engine": return { ok: true, engine };
+            case "super_share_preview": return previewReply(msg);
             case "retry_failed": return { success: true, batch: mkBatch([{ id: "222", status: "RUNNING" }], "RUNNING") };
             default: return { success: true };
           }
@@ -239,6 +243,108 @@ const scripts = ["shared/constants.js", "shared/super-share-core.js", "web/js/st
   const ssTz = ssThs.findIndex(t => t.textContent.includes("Múi giờ"));
   ok("super share: có cột 'Múi giờ' ngay sau 'Quốc gia', số cột khớp số ô", ssTz > 0 && ssThs[ssTz - 1].textContent.includes("Quốc gia") && ssThs.length === ssRow.querySelectorAll("td").length, { th: ssThs.length, td: ssRow.querySelectorAll("td").length });
   ok("super share: hiển thị 'Asia/Ho Chi Minh (UTC+7)' và '—' khi chưa có dữ liệu", ssRow.querySelectorAll("td")[ssTz].textContent === "Asia/Ho Chi Minh (UTC+7)" && $("ssTable").querySelectorAll("tbody tr")[1].querySelectorAll("td")[ssTz].textContent === "—");
+
+  // 16. Xem trước kế hoạch xóa (Graph engine; docx kiến trúc §7.3, §11.2)
+  {
+    const AmitApp = w.__G.AmitApp;
+    const mkAcc = id => ({ id, name: id, via: ["V"], viaUids: ["100000000000001"], status: "Hoạt động" });
+    AmitStorage.saveAccounts(["111", "222", "333"].map(mkAcc));
+    SS.batch = null; batchState = null; AmitBridge.isExtensionAvailable = true;
+    SS.selectedAccounts = new Set(["111", "222", "333"]);
+    $("actionSelect").value = "REMOVE_ALL_EXCEPT_SELF"; $("actionSelect").onchange();
+    const plan = (id, over) => Object.assign({
+      ad_account_id: id, action: "REMOVE_ALL_EXCEPT_SELF", status: "OK", error_code: null, error_message: null, remove_uids: ["5", "6"], other_admins: null,
+      users: [{ uid: "100000000000001", name: "Via", role: "ADMIN", mark: "SELF" }, { uid: "5", name: "An <b>x</b>", role: "ANALYST", mark: "REMOVE" }, { uid: "6", name: "Bình", role: "ADVERTISER", mark: "REMOVE" }],
+      snapshot: { created_at: new Date().toISOString(), remove_uids: ["5", "6"], keep_uids: ["100000000000001"], users: [] }
+    }, over);
+    const errPlan = id => plan(id, { status: "ERROR", error_code: "ACCOUNT_NOT_FOUND", error_message: "Không có quyền", snapshot: null, remove_uids: [], users: [] });
+
+    // a. DOM engine: giữ luồng một CTA, không xem trước
+    engine = "dom"; sent.length = 0;
+    await SS.executeWithPreview();
+    ok("preview: DOM engine -> chạy thẳng, không xem trước", sent.some(m => m.action === "execute_super_share_batch") && !sent.some(m => m.action === "super_share_preview"), sent.map(m => m.action));
+    clearInterval(SS._pollTimer); SS.batch = null; batchState = null;
+
+    // b. Graph engine: hiện kế hoạch, CHƯA gửi execute
+    engine = "graph";
+    previewReply = msg => ({ success: true, complete: true, previews: msg.items.map(i => (i.ad_account_id === "333" ? errPlan("333") : plan(i.ad_account_id))) });
+    sent.length = 0;
+    await SS.executeWithPreview();
+    const modalText = $("modalBody").textContent;
+    ok("preview: Graph -> gọi super_share_preview và CHƯA gửi execute", sent.some(m => m.action === "super_share_preview") && !sent.some(m => m.action === "execute_super_share_batch"), sent.map(m => m.action));
+    ok("preview: modal hiện ai bị xóa (tên, UID, vai trò) và tổng số", $("modalBg").style.display === "flex" && modalText.includes("Xóa 2 người") && modalText.includes("Bình") && modalText.includes("Nhà phân tích") && modalText.includes("tổng cộng 4"), modalText.slice(0, 300));
+    ok("preview: tên người dùng được escape (không chèn HTML)", $("modalBody").querySelector("table b") === null || !$("modalBody").innerHTML.includes("<b>x</b>"), $("modalBody").innerHTML.slice(0, 200));
+    ok("preview: TKQC không đọc được hiện 'Bỏ qua' kèm lý do; giữ lại self được liệt kê", modalText.includes("Bỏ qua") && modalText.includes("ACCOUNT_NOT_FOUND") && modalText.includes("Via này"));
+    ok("preview: nút xác nhận ghi rõ số TKQC sẽ chạy (2)", $("modalConfirmBtn").style.display !== "none" && $("modalConfirmBtn").textContent.includes("(2 TKQC)"), $("modalConfirmBtn").textContent);
+
+    // c. Đóng modal (Hủy) -> không có gì được gửi
+    sent.length = 0; AmitApp.closeModal(); await sleep(20);
+    ok("preview: Hủy -> không gửi execute", !sent.some(m => m.action === "execute_super_share_batch"));
+
+    // d. Xác nhận -> execute chỉ các TKQC có kế hoạch, kèm snapshot
+    await SS.executeWithPreview();
+    sent.length = 0; $("modalConfirmBtn").onclick(); await sleep(30);
+    const exec = sent.find(m => m.action === "execute_super_share_batch");
+    ok("preview: xác nhận -> execute đúng 111,222; mỗi item kèm snapshot đã xem", exec && exec.items.map(i => i.ad_account_id).join() === "111,222" && exec.items.every(i => i.snapshot && i.snapshot.remove_uids.join() === "5,6" && i.action === "REMOVE_ALL_EXCEPT_SELF"), exec);
+    ok("preview: TKQC bỏ qua hiển thị 'Bỏ qua' trong bảng tiến trình", $("progress-333").textContent.includes("Bỏ qua"), $("progress-333").textContent);
+    clearInterval(SS._pollTimer); SS.batch = null; batchState = null;
+
+    // e. Gặp PAUSED giữa chừng: dừng, không modal, không execute
+    previewReply = msg => ({ success: true, complete: false, previews: [Object.assign(plan("111"), { status: "PAUSED", error_code: "FACEBOOK_CHECKPOINT", error_message: "cp", snapshot: null, remove_uids: [], users: [] })] });
+    AmitApp.closeModal(); sent.length = 0;
+    await SS.executeWithPreview();
+    ok("preview: checkpoint giữa chừng -> báo, KHÔNG mở modal xác nhận, KHÔNG execute", $("modalBg").style.display !== "flex" && !sent.some(m => m.action === "execute_super_share_batch") && /checkpoint/i.test($("toast").textContent), $("toast").textContent);
+
+    // f. Extension báo lỗi -> không chạy
+    previewReply = () => ({ success: false, error: "ENGINE_NOT_GRAPH", message: "Xem trước kế hoạch chỉ có ở Graph engine." });
+    sent.length = 0;
+    await SS.executeWithPreview();
+    ok("preview: extension từ chối -> không modal, không execute", $("modalBg").style.display !== "flex" && !sent.some(m => m.action === "execute_super_share_batch"));
+
+    // g. Tất cả TKQC đều lỗi -> modal chỉ để đọc, không có nút xác nhận
+    previewReply = msg => ({ success: true, complete: true, previews: msg.items.map(i => errPlan(i.ad_account_id)) });
+    await SS.executeWithPreview();
+    ok("preview: không TKQC nào chạy được -> không có nút xác nhận", $("modalBg").style.display === "flex" && $("modalConfirmBtn").style.display === "none");
+    AmitApp.closeModal();
+
+    // h. REMOVE_SELF: cảnh báo mất quyền + tiêu đề riêng
+    SS.selectedAccounts = new Set(["111"]);
+    $("actionSelect").value = "REMOVE_SELF"; $("actionSelect").onchange();
+    previewReply = msg => ({ success: true, complete: true, previews: msg.items.map(i => plan(i.ad_account_id, { action: "REMOVE_SELF", remove_uids: ["100000000000001"], other_admins: 2, users: [{ uid: "100000000000001", name: "Via", role: "ADMIN", mark: "REMOVE" }, { uid: "7", name: "Khác", role: "ADMIN", mark: "KEEP" }] })) });
+    await SS.executeWithPreview();
+    ok("preview REMOVE_SELF: tiêu đề xác nhận riêng, cảnh báo mất quyền + còn 2 admin khác", $("modalTitle").textContent.includes("chính Via") && $("modalBody").textContent.includes("mất quyền truy cập") && $("modalBody").textContent.includes("còn 2 Quản trị viên"), $("modalBody").textContent.slice(0, 300));
+    AmitApp.closeModal();
+
+    // i. Chia lô 10 TKQC mỗi lần gọi extension
+    const many = Array.from({ length: 25 }, (_, i) => String(5000 + i));
+    AmitStorage.saveAccounts(many.map(mkAcc));
+    SS.selectedAccounts = new Set(many);
+    $("actionSelect").value = "REMOVE_ALL_EXCEPT_SELF"; $("actionSelect").onchange();
+    previewReply = msg => ({ success: true, complete: true, previews: msg.items.map(i => plan(i.ad_account_id)) });
+    sent.length = 0;
+    await SS.executeWithPreview();
+    const calls = sent.filter(m => m.action === "super_share_preview");
+    ok("preview: 25 TKQC được chia 10 + 10 + 5", calls.map(m => m.items.length).join() === "10,10,5", calls.map(m => m.items.length));
+    ok("preview: gom đủ 25 TKQC vào một modal xác nhận", $("modalConfirmBtn").textContent.includes("(25 TKQC)"));
+    AmitApp.closeModal();
+
+    // j. Thiếu executor_uid -> chặn trước khi xem trước
+    AmitStorage.saveAccounts([{ id: "7000", name: "x", via: ["V"], viaUids: [], status: "Hoạt động" }]);
+    SS.selectedAccounts = new Set(["7000"]);
+    sent.length = 0;
+    await SS.executeWithPreview();
+    ok("preview: TKQC chưa có UID Via -> chặn, không gọi extension", !sent.some(m => m.action === "super_share_preview" || m.action === "execute_super_share_batch"));
+
+    // k. Backoff rate limit hiển thị trên tiến trình
+    SS.batch = null;
+    SS.applyBatch(mkBatch([{ id: "111", status: "RUNNING" }], "RUNNING", { id: "bk1", backoff: { reason: "RATE_LIMITED", ad_account_id: "111", attempt: 1, max: 3, wait_ms: 30000, until: new Date(Date.now() + 30000).toISOString() } }));
+    const st = $("execState").textContent;
+    const secs = Number((st.match(/sau (\d+) giây/) || [])[1]);
+    ok("backoff: hiển thị 'giới hạn tốc độ', TKQC, đếm ngược giây và lần 1/3", st.includes("giới hạn tốc độ") && st.includes("111") && st.includes("lần 1/3") && secs >= 28 && secs <= 30, st);
+    SS.applyBatch(mkBatch([{ id: "111", status: "RUNNING" }], "RUNNING", { id: "bk1", backoff: null }));
+    ok("backoff: hết chờ -> quay lại 'Đang thực hiện'", $("execState").textContent === "Đang thực hiện");
+    clearInterval(SS._pollTimer);
+  }
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

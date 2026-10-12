@@ -11,7 +11,8 @@
  * - GET gặp lỗi tạm thời / mạng: thử lại một lần sau khoảng nghỉ ngắn.
  * - Rate limit: không thử lại; ném RATE_LIMITED (pause=true) để batch giữ hàng đợi.
  *
- * deps: { fetch, tokens (AmitTokenProvider instance), sleep(ms), log(level,event,data), timeoutMs, baseUrl }
+ * deps: { fetch, tokens (AmitTokenProvider instance), sleep(ms), log(level,event,data), timeoutMs, baseUrl,
+ *         onRequest({ endpoint, method, mutation, ms, ok, error_code, http_status }) }  // tùy chọn: số liệu cho AC11 / docx §18.1
  */
 (function (root) {
   "use strict";
@@ -28,6 +29,7 @@
     const sleep = deps.sleep || (ms => new Promise(r => setTimeout(r, ms)));
     const fetchImpl = deps.fetch;
     const baseUrl = deps.baseUrl || DEFAULT_BASE;
+    const report = info => { if (deps.onRequest) { try { deps.onRequest(info); } catch (_) { /* số liệu không được làm hỏng request */ } } };
     const defaultTimeout = deps.timeoutMs || DEFAULT_TIMEOUT_MS;
 
     async function send(tk, path, o) {
@@ -101,9 +103,11 @@
         try {
           const json = await send(tk, path, o);
           log("debug", "permission.response_classified", { request_id: id, ok: true, ms: Date.now() - t0, success: json && json.success });
+          report({ endpoint: path, method: o.method, mutation: o.mutation, ms: Date.now() - t0, ok: true });
           return json;
         } catch (e) {
           if (!(e instanceof Err().FbError)) throw e;
+          report({ endpoint: path, method: o.method, mutation: o.mutation, ms: Date.now() - t0, ok: false, error_code: e.error_code, http_status: e.http_status });
           log(e.pause ? "warn" : "debug", "permission.response_classified", { request_id: id, ok: false, ms: Date.now() - t0, error_code: e.error_code, category: e.category, http_status: e.http_status, graph_code: e.graph_code, graph_subcode: e.graph_subcode, fbtrace_id: e.fbtrace_id });
 
           if (e.category === "token") {

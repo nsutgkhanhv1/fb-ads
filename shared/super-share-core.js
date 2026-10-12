@@ -22,6 +22,7 @@
  *   requiresIdentity         -> true: luôn xác nhận executor_uid == chủ token trước mọi write (không chỉ action phụ thuộc SELF)
  *   readRoles() entry thêm   -> { protected: true } cho owner của TKQC (không bao giờ bị xóa)
  *   targetMeta(uid)          -> { method_used, ambiguous, ambiguous_error, ... } đính vào kết quả từng UID
+ *   accountInfo()            -> { owner_id, business_id } của TKQC đang mở (dùng cho xem trước / snapshot)
  */
 (function (root) {
   "use strict";
@@ -44,10 +45,15 @@
   const ACTION_DEFS = Object.freeze({
     SHARE_USER: { uid: { min: 1, max: 3 }, role: true, selfDependent: false, destructive: false, retryByTarget: true },
     REMOVE_BY_UID_EXCEPT_SELF: { uid: { min: 1, max: 3 }, role: false, selfDependent: true, destructive: true, retryByTarget: true },
-    REMOVE_ALL_EXCEPT_UIDS_AND_SELF: { uid: { min: 0, max: 3 }, role: false, selfDependent: true, destructive: true, retryByTarget: false },
-    REMOVE_ALL_EXCEPT_SELF: { uid: null, role: false, selfDependent: true, destructive: true, retryByTarget: false },
-    REMOVE_SELF: { uid: null, role: false, selfDependent: true, destructive: true, retryByTarget: false }
+    // preview: true = kế hoạch xóa phụ thuộc state hiện tại nên Graph engine bắt buộc xem trước + xác nhận (docx kiến trúc §7.3, §11.2)
+    REMOVE_ALL_EXCEPT_UIDS_AND_SELF: { uid: { min: 0, max: 3 }, role: false, selfDependent: true, destructive: true, retryByTarget: false, preview: true },
+    REMOVE_ALL_EXCEPT_SELF: { uid: null, role: false, selfDependent: true, destructive: true, retryByTarget: false, preview: true },
+    REMOVE_SELF: { uid: null, role: false, selfDependent: true, destructive: true, retryByTarget: false, preview: true }
   });
+
+  // Snapshot xem trước chỉ có giá trị trong khoảng này; quá hạn thì phải xem trước lại (docx kiến trúc §11.2).
+  const SNAPSHOT_TTL_MS = 30 * 60 * 1000;
+  const SNAPSHOT_FUTURE_SKEW_MS = 60 * 1000;
 
   // docx §16 + §34 + §60; ba mã cuối KHÔNG có trong docx (§35: trả lỗi tường minh thay vì đoán).
   const ERROR_CODES = [
@@ -64,7 +70,9 @@
     // Graph engine (docx "Định hướng kiến trúc AMIT Super Share" §12.1)
     "FACEBOOK_REAUTH_REQUIRED", "TOKEN_UNAVAILABLE", "TOKEN_OWNER_MISMATCH", "TARGET_NOT_ELIGIBLE", "TARGET_NOT_FOUND",
     "OWNER_PROTECTED", "RATE_LIMITED", "NETWORK_ERROR", "REQUEST_TIMEOUT", "FACEBOOK_GRAPH_ERROR", "GRAPH_RESPONSE_INVALID",
-    "VERIFY_UNAVAILABLE", "VERIFY_MISMATCH", "ROLE_MISMATCH", "CANCELLED"
+    "VERIFY_UNAVAILABLE", "VERIFY_MISMATCH", "ROLE_MISMATCH", "CANCELLED",
+    // xem trước / snapshot cho thao tác xóa (docx kiến trúc §7.3, §11.2)
+    "PREVIEW_REQUIRED", "SNAPSHOT_EXPIRED", "SNAPSHOT_CHANGED"
   ];
   const ERR = Object.freeze(Object.fromEntries(ERROR_CODES.map(c => [c, c])));
 
@@ -130,9 +138,37 @@
       _rawUidCount: uids.length,
       role,
       executor_uid: uidStr(raw.executor_uid) || null,
-      source: raw.source ? String(raw.source).toUpperCase() : null // "UID" | "BM_PICKER" (chỉ Graph engine dùng để chọn contract)
+      source: raw.source ? String(raw.source).toUpperCase() : null, // "UID" | "BM_PICKER" (chỉ Graph engine dùng để chọn contract)
+      snapshot: def && def.preview ? normalizeSnapshot(raw.snapshot) : null
     };
   }
+
+  /**
+   * Snapshot đến từ Web nên KHÔNG được tin: chỉ làm sạch hình dạng. Snapshot chỉ được dùng để CHẶN (hết hạn, danh sách xóa
+   * thực tế vượt quá danh sách đã xem trước), không bao giờ quyết định ai bị xóa; danh sách xóa luôn tính lại từ state thật.
+   */
+  function normalizeSnapshot(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const isUid = u => /^\d+$/.test(u);
+    const uidList = a => (Array.isArray(a) ? a : []).slice(0, 2000).map(uidStr).filter(isUid);
+    const users = (Array.isArray(raw.users) ? raw.users : []).slice(0, 2000).map(u => {
+      const x = u && typeof u === "object" ? u : {};
+      const role = String(x.role || "").toUpperCase();
+      return { uid: uidStr(x.uid), role: ROLES[role] ? role : null, via: x.via ? String(x.via).slice(0, 24) : null, protected: !!x.protected };
+    }).filter(u => isUid(u.uid));
+    return {
+      created_at: String(raw.created_at || "").slice(0, 40),
+      executor_uid: raw.executor_uid ? uidStr(raw.executor_uid) : null,
+      owner_id: raw.owner_id ? uidStr(raw.owner_id) : null,
+      business_id: raw.business_id ? uidStr(raw.business_id) : null,
+      users,
+      keep_uids: uidList(raw.keep_uids),
+      remove_uids: uidList(raw.remove_uids)
+    };
+  }
+
+  /** Item có hành động xóa theo state mà chưa có snapshot xem trước. */
+  const needsPreview = item => !!(ACTION_DEFS[item.action] && ACTION_DEFS[item.action].preview && !item.snapshot);
 
   /** Trả về null nếu hợp lệ, hoặc { error_code, message }. */
   function validateItem(item) {
@@ -170,6 +206,7 @@
       role: item.role,
       executor_uid: item.executor_uid,
       source: item.source || null,
+      snapshot: item.snapshot || null,
       engine: null,
       request_id: null,
       retryable: null,
@@ -377,12 +414,12 @@
     await forEachTarget(result, uids, (uid, ctx) => removeOne(driver, item, uid, ctx), driver);
   }
 
-  // REMOVE_ALL_EXCEPT_UIDS_AND_SELF (03) và REMOVE_ALL_EXCEPT_SELF (04) dùng chung (docx §9)
-  async function runRemoveAllExcept(driver, item, result, validateKeep) {
+  // ============================================================
+  // KẾ HOẠCH XÓA (dùng chung cho xem trước và thực thi: một nguồn sự thật)
+  // ============================================================
+  /** Ném DriverError nếu kế hoạch không thực hiện được (không có thao tác ghi nào ở đây). */
+  function planRemoveAll(roles, item, validateKeep) {
     const self = item.executor_uid;
-    setStep(result, "READ_STATE");
-    const roles = await readRolesChecked(driver, true);
-
     if (!findRole(roles, self)) {
       throw new DriverError(ERR.SELF_NOT_IDENTIFIED,
         "Không thấy Via đang thực thi (SELF) trong danh sách vai trò của TKQC nên không thể xác định SELF. Không thực hiện xóa.", "READ_STATE");
@@ -393,8 +430,6 @@
       // §25: validate 100% TRƯỚC khi xóa bất kỳ ai
       const missing = keep.filter(u => !findRole(roles, u));
       if (missing.length) {
-        missing.forEach(u => setTarget(result, u, STATUS.FAILED, null, ERR.KEEP_UID_NOT_FOUND, `Keep UID ${u} không tồn tại trong vai trò TKQC.`));
-        result.failed_uid = missing[0];
         throw new DriverError(ERR.KEEP_UID_NOT_FOUND,
           `Keep UID không tồn tại: ${missing.join(", ")}. Không có user nào bị xóa.`, "PRE_VALIDATE", { failed_uids: missing });
       }
@@ -404,6 +439,79 @@
     const existedKeep = [...keepSet].filter(u => findRole(roles, u));
     const protectedUids = roles.filter(r => r.protected).map(r => r.uid);
     const removeUids = roles.map(r => r.uid).filter(u => !keepSet.has(u) && !protectedUids.includes(u)); // owner không bao giờ bị xóa
+    return { self, keep, keepSet, existedKeep, protectedUids, removeUids };
+  }
+
+  function planRemoveSelf(roles, item) {
+    const self = item.executor_uid;
+    const me = findRole(roles, self);
+    if (!me) {
+      throw new DriverError(ERR.SELF_NOT_IDENTIFIED,
+        "Không thấy Via đang thực thi (SELF) trong danh sách vai trò của TKQC. Không thực hiện xóa.", "READ_STATE");
+    }
+    if (me.role === null) {
+      throw new DriverError(ERR.UI_VARIANT_UNKNOWN, "Không đọc được role hiện tại của SELF nên không thể áp dụng rule Admin. Không thực hiện xóa.", "READ_STATE");
+    }
+    if (me.protected) {
+      throw new DriverError(ERR.OWNER_PROTECTED, "Via đang thực thi là chủ sở hữu của TKQC nên không thể tự gỡ quyền.", "PRE_VALIDATE");
+    }
+
+    LOG("info", "core.removeself.check", { self_role: me.role, roles: roles.map(r => ({ uid: r.uid, role: r.role })) });
+    let otherAdmins = null;
+    if (me.role === ROLES.ADMIN) {
+      const others = roles.filter(r => r.uid !== self);
+      if (others.some(r => r.role === null)) {
+        throw new DriverError(ERR.UI_VARIANT_UNKNOWN, "Không đọc được role của một số user khác nên không thể kiểm tra Admin khác. Không thực hiện xóa.", "READ_STATE");
+      }
+      otherAdmins = others.filter(r => r.role === ROLES.ADMIN).length;
+      if (otherAdmins === 0) {
+        throw new DriverError(ERR.NO_OTHER_ADMIN,
+          "Không thể xóa chính mình vì tài khoản quảng cáo không còn Quản trị viên nào khác.", "PRE_VALIDATE");
+      }
+    }
+    return { me, otherAdmins };
+  }
+
+  /**
+   * Snapshot chặn thao tác xóa khi kế hoạch đã cũ hoặc state thật đã đổi so với lúc người dùng xem trước (docx kiến trúc §11.2).
+   * Không có snapshot (DOM engine, hoặc item cũ) thì không kiểm tra. Danh sách xóa thật ít hơn danh sách đã xem trước là an toàn.
+   */
+  function checkSnapshot(item, removeUids, nowIso) {
+    const s = item.snapshot;
+    if (!s) return;
+    const age = Date.parse(nowIso) - Date.parse(s.created_at);
+    if (!Number.isFinite(age) || age > SNAPSHOT_TTL_MS || age < -SNAPSHOT_FUTURE_SKEW_MS) {
+      throw new DriverError(ERR.SNAPSHOT_EXPIRED,
+        `Kế hoạch xem trước đã hết hạn (quá ${Math.round(SNAPSHOT_TTL_MS / 60000)} phút) hoặc không hợp lệ. Không có user nào bị xóa. Hãy xem trước lại.`, "PRE_VALIDATE");
+    }
+    const extra = removeUids.filter(u => !s.remove_uids.includes(u));
+    const wrongExecutor = s.executor_uid && item.executor_uid && s.executor_uid !== item.executor_uid;
+    if (extra.length || wrongExecutor) {
+      throw new DriverError(ERR.SNAPSHOT_CHANGED,
+        wrongExecutor
+          ? "Via thực thi khác với lúc xem trước. Không có user nào bị xóa. Hãy xem trước lại."
+          : `Danh sách người dùng của TKQC đã thay đổi từ lúc xem trước (sẽ xóa thêm ${extra.length} UID chưa từng được xác nhận: ${extra.slice(0, 5).join(", ")}${extra.length > 5 ? "…" : ""}). Không có user nào bị xóa. Hãy xem trước lại.`,
+        "PRE_VALIDATE", { extra_uids: extra });
+    }
+  }
+
+  // REMOVE_ALL_EXCEPT_UIDS_AND_SELF (03) và REMOVE_ALL_EXCEPT_SELF (04) dùng chung (docx §9)
+  async function runRemoveAllExcept(driver, item, result, validateKeep, now) {
+    setStep(result, "READ_STATE");
+    const roles = await readRolesChecked(driver, true);
+
+    let plan;
+    try {
+      plan = planRemoveAll(roles, item, validateKeep);
+    } catch (e) {
+      if (e instanceof DriverError && e.code === ERR.KEEP_UID_NOT_FOUND) {
+        const missing = (e.detail && e.detail.failed_uids) || [];
+        missing.forEach(u => setTarget(result, u, STATUS.FAILED, null, ERR.KEEP_UID_NOT_FOUND, `Keep UID ${u} không tồn tại trong vai trò TKQC.`));
+        result.failed_uid = missing[0];
+      }
+      throw e;
+    }
+    const { self, keep, existedKeep, protectedUids, removeUids } = plan;
     LOG("info", "core.removeall.plan", { self, keep, protected_owner: protectedUids, keep_validated: validateKeep, roles: roles.map(r => ({ uid: r.uid, role: r.role })), remove_set: removeUids });
 
     setStep(result, "EXECUTE");
@@ -411,6 +519,7 @@
       result.note = "NO_ACTION_REQUIRED";
       return;
     }
+    checkSnapshot(item, removeUids, now());
     // Mỗi lần xóa đều đọc lại state (removeOne), không dùng index cố định (docx §8, §33)
     await forEachTarget(result, removeUids, (uid, ctx) => removeOne(driver, item, uid, ctx), driver);
 
@@ -426,34 +535,12 @@
   // ============================================================
   // REMOVE_SELF (docx §10, §27, §28)
   // ============================================================
-  async function runRemoveSelf(driver, item, result) {
+  async function runRemoveSelf(driver, item, result, now) {
     const self = item.executor_uid;
     setStep(result, "READ_STATE");
     const roles = await readRolesChecked(driver, false);
-    const me = findRole(roles, self);
-    if (!me) {
-      throw new DriverError(ERR.SELF_NOT_IDENTIFIED,
-        "Không thấy Via đang thực thi (SELF) trong danh sách vai trò của TKQC. Không thực hiện xóa.", "READ_STATE");
-    }
-    if (me.role === null) {
-      throw new DriverError(ERR.UI_VARIANT_UNKNOWN, "Không đọc được role hiện tại của SELF nên không thể áp dụng rule Admin. Không thực hiện xóa.", "READ_STATE");
-    }
-    if (me.protected) {
-      throw new DriverError(ERR.OWNER_PROTECTED, "Via đang thực thi là chủ sở hữu của TKQC nên không thể tự gỡ quyền.", "PRE_VALIDATE");
-    }
-
-    LOG("info", "core.removeself.check", { self_role: me.role, roles: roles.map(r => ({ uid: r.uid, role: r.role })) });
-    if (me.role === ROLES.ADMIN) {
-      const others = roles.filter(r => r.uid !== self);
-      if (others.some(r => r.role === null)) {
-        throw new DriverError(ERR.UI_VARIANT_UNKNOWN, "Không đọc được role của một số user khác nên không thể kiểm tra Admin khác. Không thực hiện xóa.", "READ_STATE");
-      }
-      const otherAdmins = others.filter(r => r.role === ROLES.ADMIN).length;
-      if (otherAdmins === 0) {
-        throw new DriverError(ERR.NO_OTHER_ADMIN,
-          "Không thể xóa chính mình vì tài khoản quảng cáo không còn Quản trị viên nào khác.", "PRE_VALIDATE");
-      }
-    }
+    planRemoveSelf(roles, item);
+    checkSnapshot(item, [self], now());
 
     setStep(result, "EXECUTE");
     await driver.assertContext(item.ad_account_id);
@@ -474,6 +561,106 @@
     }
     setTarget(result, self, STATUS.SUCCESS, "REMOVED", null, null, graphExtras(driver, result, self, { verify_state: "MATCH" }, null));
     result.note = "SELF_REMOVED"; // AMIT phải sync lại dataset (docx §28)
+  }
+
+  // ============================================================
+  // SESSION -> IDENTITY -> OPEN_ACCOUNT (dùng chung cho runItem và previewItem)
+  // ============================================================
+  async function openContext(driver, item, def, result) {
+    setStep(result, "SESSION");
+    const state = await driver.getSessionState();
+    if (state === "EXPIRED") throw new DriverError(ERR.SESSION_EXPIRED, "Facebook yêu cầu đăng nhập lại.", "SESSION");
+    if (state === "CHECKPOINT") throw new DriverError(ERR.FACEBOOK_CHECKPOINT, "Facebook yêu cầu xác minh bảo mật (checkpoint).", "SESSION");
+
+    if (def.selfDependent || driver.requiresIdentity) {
+      // §26: không đoán SELF. Graph engine: mọi write đều phải biết token thuộc ai (AC05)
+      setStep(result, "IDENTITY");
+      const current = await driver.getSessionUid();
+      if (!item.executor_uid) {
+        throw new DriverError(ERR.EXECUTOR_IDENTITY_MISMATCH, "Thiếu executor_uid nên không thể xác nhận SELF. Không thực hiện write action.", "IDENTITY");
+      }
+      if (!current) {
+        throw new DriverError(ERR.EXECUTOR_IDENTITY_MISMATCH, "Không đọc được UID của session Facebook hiện tại. Không thực hiện write action.", "IDENTITY");
+      }
+      if (current !== item.executor_uid) {
+        throw new DriverError(ERR.EXECUTOR_IDENTITY_MISMATCH,
+          "Facebook đang đăng nhập trên browser không khớp executor AMIT dự kiến. Không thực hiện write action.", "IDENTITY");
+      }
+    }
+
+    setStep(result, "OPEN_ACCOUNT");
+    await driver.openAccount(item.ad_account_id);
+  }
+
+  // ============================================================
+  // PREVIEW (chỉ ĐỌC; docx kiến trúc §7.3, §11.2)
+  // ============================================================
+  /**
+   * Dựng kế hoạch xóa cho 1 TKQC mà không ghi gì. Luôn trả về object, không ném lỗi.
+   *   status: OK (có kế hoạch) | BLOCKED (kế hoạch bị luật chặn, vd NO_OTHER_ADMIN; vẫn có snapshot) |
+   *           ERROR (không đọc được state) | PAUSED (session / checkpoint / rate limit)
+   */
+  async function previewItem(driver, rawItem, opts) {
+    opts = opts || {};
+    LOG = typeof opts.log === "function" ? opts.log : () => {};
+    const now = opts.now || (() => new Date().toISOString());
+    const item = normalizeItem(rawItem);
+    const out = {
+      ad_account_id: item.ad_account_id, action: item.action, status: "OK", step: null,
+      error_code: null, error_message: null,
+      self_uid: item.executor_uid, owner_id: null, business_id: null,
+      users: [], remove_uids: [], keep_uids: [], other_admins: null, snapshot: null
+    };
+    const stop = (status, code, message) => { out.status = status; out.error_code = code; out.error_message = message; return out; };
+
+    const invalid = validateItem(item);
+    if (invalid) return stop("ERROR", invalid.error_code, invalid.message);
+    const def = ACTION_DEFS[item.action];
+    if (!def.preview) return stop("ERROR", ERR.INVALID_INPUT, "Action này không cần xem trước.");
+
+    try {
+      await openContext(driver, item, def, out);
+      setStep(out, "READ_STATE");
+      const roles = await readRolesChecked(driver, true);
+      const info = typeof driver.accountInfo === "function" ? driver.accountInfo() : null;
+      out.owner_id = (info && info.owner_id) || (roles.find(r => r.protected) || {}).uid || null;
+      out.business_id = (info && info.business_id) || null;
+
+      try {
+        if (item.action === ACTIONS.REMOVE_SELF) {
+          out.other_admins = planRemoveSelf(roles, item).otherAdmins;
+          out.remove_uids = [item.executor_uid];
+        } else {
+          out.remove_uids = planRemoveAll(roles, item, item.action === ACTIONS.REMOVE_ALL_EXCEPT_UIDS_AND_SELF).removeUids;
+        }
+      } catch (e) {
+        if (!(e instanceof DriverError) || isPauseCode(e.code)) throw e;
+        out.step = e.step || out.step;
+        stop("BLOCKED", e.code, e.message);
+        out.remove_uids = [];
+      }
+
+      const removing = new Set(out.remove_uids);
+      out.keep_uids = roles.map(r => r.uid).filter(u => !removing.has(u));
+      out.users = roles.map(r => ({
+        uid: r.uid, name: r.name || "", role: r.role, via: r.via || null, protected: !!r.protected,
+        mark: removing.has(r.uid) ? "REMOVE" : (r.uid === item.executor_uid ? "SELF" : (r.protected ? "OWNER" : "KEEP"))
+      }));
+      out.snapshot = {
+        created_at: now(), executor_uid: item.executor_uid, owner_id: out.owner_id, business_id: out.business_id,
+        users: out.users.map(u => ({ uid: u.uid, role: u.role, via: u.via, protected: u.protected })),
+        keep_uids: out.keep_uids, remove_uids: out.remove_uids
+      };
+    } catch (e) {
+      const code = e instanceof DriverError ? e.code : ERR.FACEBOOK_ACTION_ERROR;
+      if (e instanceof DriverError && e.step) out.step = e.step;
+      stop(isPauseCode(code) ? "PAUSED" : "ERROR", code, e && e.message ? e.message : String(e));
+    }
+    LOG(out.status === "ERROR" || out.status === "PAUSED" ? "warn" : "info", "core.preview", {
+      ad_account_id: out.ad_account_id, action: out.action, status: out.status, error_code: out.error_code,
+      users: out.users.length, remove: out.remove_uids.length, keep: out.keep_uids.length
+    });
+    return out;
   }
 
   // ============================================================
@@ -505,29 +692,7 @@
     const def = ACTION_DEFS[item.action];
 
     try {
-      setStep(result, "SESSION");
-      const state = await driver.getSessionState();
-      if (state === "EXPIRED") throw new DriverError(ERR.SESSION_EXPIRED, "Facebook yêu cầu đăng nhập lại.", "SESSION");
-      if (state === "CHECKPOINT") throw new DriverError(ERR.FACEBOOK_CHECKPOINT, "Facebook yêu cầu xác minh bảo mật (checkpoint).", "SESSION");
-
-      if (def.selfDependent || driver.requiresIdentity) {
-        // §26: không đoán SELF. Graph engine: mọi write đều phải biết token thuộc ai (AC05)
-        setStep(result, "IDENTITY");
-        const current = await driver.getSessionUid();
-        if (!item.executor_uid) {
-          throw new DriverError(ERR.EXECUTOR_IDENTITY_MISMATCH, "Thiếu executor_uid nên không thể xác nhận SELF. Không thực hiện write action.", "IDENTITY");
-        }
-        if (!current) {
-          throw new DriverError(ERR.EXECUTOR_IDENTITY_MISMATCH, "Không đọc được UID của session Facebook hiện tại. Không thực hiện write action.", "IDENTITY");
-        }
-        if (current !== item.executor_uid) {
-          throw new DriverError(ERR.EXECUTOR_IDENTITY_MISMATCH,
-            "Facebook đang đăng nhập trên browser không khớp executor AMIT dự kiến. Không thực hiện write action.", "IDENTITY");
-        }
-      }
-
-      setStep(result, "OPEN_ACCOUNT");
-      await driver.openAccount(item.ad_account_id);
+      await openContext(driver, item, def, result);
 
       switch (item.action) {
         case ACTIONS.SHARE_USER: {
@@ -549,13 +714,13 @@
           await runRemoveByUid(driver, item, result);
           break;
         case ACTIONS.REMOVE_ALL_EXCEPT_UIDS_AND_SELF:
-          await runRemoveAllExcept(driver, item, result, true);
+          await runRemoveAllExcept(driver, item, result, true, now);
           break;
         case ACTIONS.REMOVE_ALL_EXCEPT_SELF:
-          await runRemoveAllExcept(driver, item, result, false);
+          await runRemoveAllExcept(driver, item, result, false, now);
           break;
         case ACTIONS.REMOVE_SELF:
-          await runRemoveSelf(driver, item, result);
+          await runRemoveSelf(driver, item, result, now);
           break;
       }
     } catch (e) {
@@ -626,7 +791,8 @@
         target_uids: byTarget ? failedUids : it.target_uids.slice(),
         role: it.role,
         executor_uid: it.executor_uid,
-        source: it.source || null
+        source: it.source || null,
+        snapshot: it.snapshot || null
       });
     }
     return out;
@@ -635,9 +801,9 @@
   const api = {
     ACTIONS, ROLES, DEFAULT_ROLE, ACTION_DEFS, ERR, ERROR_CODES, PAUSE_CODES, RETRYABLE_CODES, STATUS, BATCH_STATUS, DELAY,
     DriverError, isPauseCode,
-    normalizeItem, validateItem, clampDelay,
+    normalizeItem, validateItem, clampDelay, needsPreview, SNAPSHOT_TTL_MS,
     newItemResult, newBatch, recount, isResumable, buildRetryItems,
-    runItem
+    runItem, previewItem
   };
 
   root.AmitSuperShareCore = api;

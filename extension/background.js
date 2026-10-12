@@ -7,6 +7,7 @@ importScripts(
   "../shared/logger.js", "../shared/constants.js", "../shared/fb-api.js", "../shared/super-share-core.js",
   "../shared/facebook/error-classifier.js", "../shared/facebook/permission-contracts.js",
   "../shared/facebook/token-provider.js", "../shared/facebook/graph-client.js",
+  "../shared/metrics.js", "services/metrics-service.js",
   "services/permission-service.js", "services/permission-message-handler.js",
   "batch-controller.js", "jev.js"
 );
@@ -370,6 +371,31 @@ async function handleMessage(request, sender, sendResponse) {
       // ---- Graph engine (docx "Định hướng kiến trúc AMIT Super Share") ----
       case "permission_execute":
         sendResponse(await handlePermissionExecute(request.command));
+        break;
+
+      // Số liệu nghiệm thu AC10 / AC11: chỉ từ trang của chính extension (trang Log), không phải content script trên facebook.com.
+      case "get_metrics":
+      case "set_metrics_config":
+      case "export_metrics":
+      case "clear_metrics": {
+        if (!sender.url || !sender.url.startsWith(chrome.runtime.getURL(""))) {
+          sendResponse({ ok: false, error: "Không được phép" });
+          break;
+        }
+        sendResponse(act === "get_metrics" ? await handleGetMetrics()
+          : act === "set_metrics_config" ? await handleSetMetricsConfig(request.patch)
+          : act === "export_metrics" ? await handleExportMetrics()
+          : await handleClearMetrics());
+        break;
+      }
+
+      // Xem trước kế hoạch xóa (chỉ đọc). Chỉ từ trang của chính extension, không phải content script trên facebook.com.
+      case "super_share_preview":
+        if (!sender.url || !sender.url.startsWith(chrome.runtime.getURL(""))) {
+          sendResponse({ success: false, error: "Không được phép" });
+          break;
+        }
+        sendResponse(await handleSuperSharePreview(request.items));
         break;
 
       // Engine Super Share: chỉ đổi được từ trang của chính extension (popup / web), không phải content script trên facebook.com.

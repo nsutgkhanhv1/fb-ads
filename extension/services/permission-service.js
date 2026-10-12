@@ -268,7 +268,10 @@
         return sig;
       },
 
-      targetMeta(uid) { return metas.get(uid) || null; }
+      targetMeta(uid) { return metas.get(uid) || null; },
+
+      /** Owner / business của TKQC đang mở (đã xác minh ở openAccount); dùng cho xem trước và snapshot. */
+      accountInfo() { return state.account ? { owner_id: state.account.ownerId, business_id: state.account.businessId } : null; }
     };
     return driver;
   }
@@ -323,7 +326,18 @@
     return SS.runItem(driver, rawItem, Object.assign({}, opts, { requestId, log: (opts && opts.log) || deps.log }));
   }
 
-  const api = { createGraphDriver, runItem, commandToItem, toPermissionResult, PURPOSE };
+  /**
+   * Xem trước kế hoạch xóa của một TKQC (chỉ GET, không ghi). Cùng driver và cùng luật với runItem nên kế hoạch khớp
+   * với thứ sẽ được thực thi. Không ném lỗi.
+   */
+  async function previewItem(deps, rawItem, opts) {
+    const { SS } = lazy();
+    const item = SS.normalizeItem(rawItem);
+    const driver = createGraphDriver(deps, item);
+    return SS.previewItem(driver, rawItem, Object.assign({}, opts, { log: (opts && opts.log) || deps.log }));
+  }
+
+  const api = { createGraphDriver, runItem, previewItem, commandToItem, toPermissionResult, PURPOSE };
   root.AmitPermissionService = api;
   if (typeof module !== "undefined" && module.exports) module.exports = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

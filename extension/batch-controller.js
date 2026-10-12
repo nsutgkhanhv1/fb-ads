@@ -20,6 +20,11 @@ const SS_ADS_MANAGER_ROOT = "https://adsmanager.facebook.com/";
 const SS_ITEM_TIMEOUT_MS = 6 * 60 * 1000;
 const SS_PAGE_LEVEL_CODES = ["PAGE_LOAD_FAILED", "ROLE_SECTION_NOT_FOUND"];
 
+// Graph engine, khi Facebook báo rate limit (docx kiến trúc §10.2, §12): đợi theo Retry-After, nếu không có thì lùi cấp số nhân,
+// chạy lại CHÍNH TKQC đó (an toàn: core luôn đọc lại state trước khi ghi). Hết số lần thì PAUSED như cũ để người dùng bấm Tiếp tục.
+// Retry-After dài hơn maxMs thì không đứng chờ trong service worker mà PAUSED ngay.
+const SS_RATE_BACKOFF = { maxAttempts: 3, baseMs: 30000, minMs: 5000, maxMs: 5 * 60 * 1000, jitter: 0.2 };
+
 let currentBatch = null;
 let runnerWindowId = null;
 let runnerTabId = null;
@@ -57,6 +62,7 @@ const batchReady = (async function restoreBatch() {
     if (wasRunning) {
       b.status = SS.BATCH_STATUS.PAUSED;
       b.pause_reason = "EXTENSION_RESTARTED";
+      b.backoff = null;
       b.items.forEach(i => { if (i.status === SS.STATUS.RUNNING) i.status = SS.STATUS.PAUSED; });
       await chrome.storage.local.set({ [SS_BATCH_KEY]: b });
     }
@@ -93,7 +99,8 @@ const inputOf = it => ({
   target_uids: it.target_uids,
   role: it.role,
   executor_uid: it.executor_uid,
-  source: it.source || null
+  source: it.source || null,
+  snapshot: it.snapshot || null
 });
 
 function failedResult(input, code, message, step) {
@@ -141,9 +148,19 @@ async function startBatch(req, meta) {
     }
   }
 
+  // Graph engine: xóa hàng loạt / tự gỡ phải có snapshot đã xem trước và xác nhận (docx kiến trúc §7.3, §11.2).
+  const engine = typeof getSuperShareEngine === "function" ? await getSuperShareEngine() : "dom";
+  if (engine === "graph") {
+    const missing = items.map(i => SS.normalizeItem(i || {})).filter(SS.needsPreview);
+    if (missing.length) {
+      return reject("PREVIEW_REQUIRED", `${missing.length} TKQC chưa có kế hoạch xem trước đã xác nhận (ví dụ ${missing[0].ad_account_id}). Hãy xem trước rồi xác nhận trước khi chạy.`);
+    }
+  }
+
   const batch = SS.newBatch({ items, delay_seconds: req.delay_seconds }, `batch_${Date.now()}`, ssNow());
   if (meta && meta.retry_of) batch.retry_of = meta.retry_of;
-  batch.engine = typeof getSuperShareEngine === "function" ? await getSuperShareEngine() : "dom";
+  batch.attempt = (meta && meta.attempt) || 1;
+  batch.engine = engine;
   currentBatch = batch;
   clog("info", "batch.created", {
     id: batch.id, retry_of: batch.retry_of || null, engine: batch.engine, total: batch.total, delay_seconds: batch.delay_seconds,
@@ -188,7 +205,12 @@ async function retryFailed(onlyAdAccountId) {
   if (onlyAdAccountId) items = items.filter(i => i.ad_account_id === String(onlyAdAccountId));
   clog("info", "batch.retry", { from: currentBatch.id, only: onlyAdAccountId || null, items: items.map(i => ({ id: i.ad_account_id, action: i.action, uids: i.target_uids })) });
   if (!items.length) return { success: false, error: "NOTHING_TO_RETRY", message: "Không có target thất bại nào để Retry." };
-  return startBatch({ items, delay_seconds: currentBatch.delay_seconds }, { retry_of: currentBatch.id });
+  const attempt = (currentBatch.attempt || 1) + 1;
+  const failedBy = new Map(currentBatch.items.map(i => [i.ad_account_id, i.error_code]));
+  const res = await startBatch({ items, delay_seconds: currentBatch.delay_seconds }, { retry_of: currentBatch.id, attempt });
+  // retry_total (docx §18.1): theo lớp lỗi và số lần thử; chỉ đếm khi batch Retry thật sự được tạo
+  if (res && res.success && typeof metricsEvent === "function") items.forEach(i => metricsEvent("retry", { error_code: failedBy.get(i.ad_account_id) || null, attempt }));
+  return res;
 }
 
 // ============================================================
@@ -221,13 +243,28 @@ async function runBatchLoop(batch) {
 
       const tItem = Date.now();
       let result;
-      try {
-        result = batch.engine === "graph" ? await executeItemViaGraph(inputOf(item)) : await executeItemOnTab(inputOf(item));
-      } catch (e) {
-        clog("error", "item.exception", { ad_account_id: item.ad_account_id, error: e });
-        result = failedResult(inputOf(item), SS.ERR.FACEBOOK_ACTION_ERROR, e && e.message ? e.message : String(e), "CONTROLLER");
+      let backoffMs = 0; // thời gian chờ rate limit không tính vào thời gian xử lý (AC11)
+      for (let rateAttempt = 0; ; rateAttempt++) {
+        try {
+          result = batch.engine === "graph" ? await executeItemViaGraph(inputOf(item)) : await executeItemOnTab(inputOf(item));
+        } catch (e) {
+          clog("error", "item.exception", { ad_account_id: item.ad_account_id, error: e });
+          result = failedResult(inputOf(item), SS.ERR.FACEBOOK_ACTION_ERROR, e && e.message ? e.message : String(e), "CONTROLLER");
+        }
+        const wait = rateBackoffWaitMs(batch, result, rateAttempt);
+        if (wait === null) break;
+        clog("warn", "batch.backoff", { id: batch.id, ad_account_id: item.ad_account_id, attempt: rateAttempt + 1, max: SS_RATE_BACKOFF.maxAttempts, wait_ms: wait, retry_after_ms: (result.detail && result.detail.retry_after_ms) || null });
+        batch.backoff = { reason: SS.ERR.RATE_LIMITED, ad_account_id: item.ad_account_id, attempt: rateAttempt + 1, max: SS_RATE_BACKOFF.maxAttempts, wait_ms: wait, until: new Date(Date.now() + wait).toISOString() };
+        await commitBatch();
+        if (typeof metricsEvent === "function") metricsEvent("rate_backoff", { attempt: rateAttempt + 1 });
+        await ssSleep(wait);
+        backoffMs += wait;
+        batch.backoff = null;
+        if (currentBatch !== batch) { clog("warn", "batch.loop.superseded", { id: batch.id }); return; }
       }
+      batch.backoff = null;
       batch.items[i] = result;
+      if (typeof metricsRecordItem === "function") metricsRecordItem(batch, result, { item_ms: Date.now() - tItem, backoff_ms: backoffMs });
       clog(result.status === SS.STATUS.SUCCESS ? "info" : "warn", "item.finish", Object.assign({ batch: batch.id, index: i, ms: Date.now() - tItem }, summarizeItemResult(result)));
       await commitBatch(); // báo kết quả NGAY, trước delay (docx §38, §53)
 
@@ -267,6 +304,8 @@ async function runBatchLoop(batch) {
 
 async function pauseBatch(batch, reason) {
   batch.status = SS.BATCH_STATUS.PAUSED;
+  batch.backoff = null;
+  if (typeof metricsEvent === "function") metricsEvent("batch_paused", { reason }); // batch_paused_total theo login / checkpoint / reauth / rate limit
   batch.pause_reason = reason;
   clog("warn", "batch.paused", { id: batch.id, reason, processed: batch.processed, total: batch.total });
   await commitBatch();
@@ -281,6 +320,23 @@ function graphDelayMs(batch) {
   const chosen = Number(batch.delay_seconds) || 0;
   if (chosen > 5) return chosen * 1000;
   return Math.round(2000 + Math.random() * 3000);
+}
+
+/** Thời gian chờ (ms) trước lần chạy lại thứ `attempt` sau rate limit; Retry-After của Facebook được tôn trọng làm mức tối thiểu. */
+function rateBackoffMs(attempt, retryAfterMs) {
+  const c = SS_RATE_BACKOFF;
+  const hinted = Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? retryAfterMs : 0;
+  const base = Math.max(hinted, c.baseMs * Math.pow(2, attempt));
+  return Math.round(Math.min(c.maxMs, Math.max(c.minMs, base * (1 + Math.random() * c.jitter))));
+}
+
+/** null = không tự chờ (PAUSED như cũ); số = chờ chừng đó ms rồi chạy lại TKQC. */
+function rateBackoffWaitMs(batch, result, attempt) {
+  if (batch.engine !== "graph" || !result || result.status !== SS.STATUS.PAUSED || result.error_code !== SS.ERR.RATE_LIMITED) return null;
+  if (attempt >= SS_RATE_BACKOFF.maxAttempts) return null;
+  const hinted = result.detail && result.detail.retry_after_ms;
+  if (Number.isFinite(hinted) && hinted > SS_RATE_BACKOFF.maxMs) return null; // Facebook bảo chờ quá lâu: để người dùng quyết định
+  return rateBackoffMs(attempt, hinted);
 }
 
 /** Chạy một TKQC bằng Graph: không mở tab, không click DOM, không gọi Jev. Không ném lỗi (lỗi được chuẩn hóa trong result). */
