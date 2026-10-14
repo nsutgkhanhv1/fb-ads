@@ -36,6 +36,14 @@
     .viewer { max-height: 340px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .viewer div { padding: 3px 8px; border-bottom: 1px solid var(--line); white-space: pre-wrap; word-break: break-word; }
     .lvl-warn { color: var(--warn); } .lvl-error { color: var(--err); font-weight: 600; } .lvl-debug { color: var(--muted); }
+    .badge { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 12px; font-weight: 700; border: 1px solid currentColor; }
+    .badge.ok { color: var(--ok); } .badge.warn { color: var(--warn); } .badge.err { color: var(--err); }
+    table.m { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+    table.m th, table.m td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+    table.m th { color: var(--muted); font-weight: 600; }
+    .ac { border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+    input.num { width: 90px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--text); font: inherit; }
+    details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 10px; }
     label.inline { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
   </style>
 </head>
@@ -67,6 +75,25 @@
       <button class="danger" id="clearBtn">Xóa log</button>
     </div>
     <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="card" id="metricsCard">
+    <b>Số liệu nghiệm thu Graph engine (AC10 / AC11)</b>
+    <p class="sub" style="margin:4px 0 10px">Tự ghi từ mọi batch Super Share. Không chứa token, cookie, UID hay tên người dùng. Chỉ tính lần chạy đầu (bỏ Retry).</p>
+    <div class="row" style="margin:0 0 12px;align-items:center">
+      <label class="inline">Ngưỡng AC10 (% xác minh thành công) <input class="num" id="mThreshold" type="number" min="1" max="100" step="0.1" placeholder="chưa đặt"></label>
+      <label class="inline">Số mẫu tối thiểu mỗi bên <input class="num" id="mMinSamples" type="number" min="1" step="1"></label>
+      <button id="mSave">Lưu</button>
+    </div>
+    <div class="stats" id="acBoxes"></div>
+    <div id="engineTable"></div>
+    <details><summary>Chỉ số vận hành (docx §18.1)</summary><div id="opsTables"></div></details>
+    <div class="row">
+      <button id="mRefresh">Làm mới</button>
+      <button class="primary" id="mExport">Xuất số liệu (JSON)</button>
+      <button class="danger" id="mClear">Xóa số liệu</button>
+    </div>
+    <div class="msg" id="mMsg"></div>
   </div>
 
   <div class="card">

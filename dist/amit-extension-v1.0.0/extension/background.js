@@ -3,7 +3,14 @@
  * Xử lý Declarative Net Request, Session Management tự động từ Cookie, Proxy CORS và Sequential Super Share Engine
  */
 
-importScripts("../shared/logger.js", "../shared/constants.js", "../shared/fb-api.js", "../shared/super-share-core.js", "batch-controller.js", "jev.js");
+importScripts(
+  "../shared/logger.js", "../shared/constants.js", "../shared/fb-api.js", "../shared/super-share-core.js",
+  "../shared/facebook/error-classifier.js", "../shared/facebook/permission-contracts.js",
+  "../shared/facebook/token-provider.js", "../shared/facebook/graph-client.js",
+  "../shared/metrics.js", "services/metrics-service.js",
+  "services/permission-service.js", "services/permission-message-handler.js",
+  "batch-controller.js", "jev.js"
+);
 
 // Service worker là nơi duy nhất ghi log vào storage (các ngữ cảnh khác gửi message log_append)
 AmitLog.init("sw", { direct: true });
@@ -13,7 +20,6 @@ console.log("[AMIT V1] Background Service Worker loaded");
 // Cấu hình Declarative Net Request để lách CORS Facebook
 chrome.runtime.onInstalled.addListener(details => {
   AmitLog.info("sw.onInstalled", { reason: details && details.reason, previous: details && details.previousVersion });
-  setupDnrRules();
   injectIntoExistingFacebookTabs();
   resolveFacebookSession(true);
   setupAutoSyncAlarm();
@@ -38,8 +44,8 @@ chrome.alarms.onAlarm.addListener(alarm => {
   }
 });
 
-function setupDnrRules() {
-  chrome.declarativeNetRequest.updateDynamicRules({
+async function setupDnrRules() {
+  await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: [1],
     addRules: [{
       id: 1,
@@ -54,13 +60,26 @@ function setupDnrRules() {
       },
       condition: {
         urlFilter: "*facebook.com*",
+        // Chỉ áp dụng cho request do CHÍNH extension phát ra (service worker / trang extension), không đụng vào
+        // XHR của các trang facebook.com mà người dùng đang duyệt (docx Graph architecture §13, §19).
+        initiatorDomains: [chrome.runtime.id],
         resourceTypes: [chrome.declarativeNetRequest.ResourceType.XMLHTTPREQUEST]
       }
     }]
   });
-  AmitLog.info("sw.dnr.configured", {});
+  // Ghi lại luật đang có hiệu lực để log gửi dev chứng minh luật cũ (áp cho MỌI XHR facebook.com) đã bị thay.
+  try {
+    const rules = await chrome.declarativeNetRequest.getDynamicRules();
+    AmitLog.info("sw.dnr.configured", { rules: rules.map(r => ({ id: r.id, initiatorDomains: r.condition.initiatorDomains || null, urlFilter: r.condition.urlFilter })) });
+  } catch (e) {
+    AmitLog.info("sw.dnr.configured", {});
+  }
   console.log("[AMIT V1] DNR Header Rewrite Rules configured");
 }
+
+// Chạy mỗi lần service worker nạp (không chỉ lúc cài đặt): máy khách đã cài bản cũ có thể còn luật cũ
+// (đổi Origin của MỌI XHR facebook.com -> Facebook báo "unknown error (empty response)"); lệnh này ghi đè luật id=1.
+setupDnrRules().catch(e => AmitLog.warn("sw.dnr.failed", { error: e }));
 
 /**
  * Tự động inject script vào tất cả các tab Facebook đã mở sẵn
@@ -349,6 +368,49 @@ async function handleMessage(request, sender, sendResponse) {
         break;
       }
 
+      // ---- Graph engine (docx "Định hướng kiến trúc AMIT Super Share") ----
+      case "permission_execute":
+        sendResponse(await handlePermissionExecute(request.command));
+        break;
+
+      // Số liệu nghiệm thu AC10 / AC11: chỉ từ trang của chính extension (trang Log), không phải content script trên facebook.com.
+      case "get_metrics":
+      case "set_metrics_config":
+      case "export_metrics":
+      case "clear_metrics": {
+        if (!sender.url || !sender.url.startsWith(chrome.runtime.getURL(""))) {
+          sendResponse({ ok: false, error: "Không được phép" });
+          break;
+        }
+        sendResponse(act === "get_metrics" ? await handleGetMetrics()
+          : act === "set_metrics_config" ? await handleSetMetricsConfig(request.patch)
+          : act === "export_metrics" ? await handleExportMetrics()
+          : await handleClearMetrics());
+        break;
+      }
+
+      // Xem trước kế hoạch xóa (chỉ đọc). Chỉ từ trang của chính extension, không phải content script trên facebook.com.
+      case "super_share_preview":
+        if (!sender.url || !sender.url.startsWith(chrome.runtime.getURL(""))) {
+          sendResponse({ success: false, error: "Không được phép" });
+          break;
+        }
+        sendResponse(await handleSuperSharePreview(request.items));
+        break;
+
+      // Engine Super Share: chỉ đổi được từ trang của chính extension (popup / web), không phải content script trên facebook.com.
+      case "get_super_share_engine":
+      case "set_super_share_engine": {
+        if (!sender.url || !sender.url.startsWith(chrome.runtime.getURL(""))) {
+          sendResponse({ ok: false, error: "Không được phép" });
+          break;
+        }
+        sendResponse(act === "get_super_share_engine"
+          ? { ok: true, engine: await getSuperShareEngine() }
+          : await setSuperShareEngine(request.engine));
+        break;
+      }
+
       case "execute_super_share_batch":
         sendResponse(await startBatch({ items: request.items, delay_seconds: request.delay_seconds }));
         break;
@@ -510,7 +572,8 @@ async function resolveFacebookSession(forceRefresh = false) {
             target: { tabId: tab.id },
             func: () => {
               const html = document.documentElement.outerHTML;
-              const m = html.match(/"(EA[A-Za-z0-9]{20,})"/);
+              // Ưu tiên window.__accessToken (nguồn rõ ràng); regex chung chỉ là dự phòng
+              const m = html.match(/__accessToken["']?\s*[=:]\s*["'](EA[A-Za-z0-9]{20,})["']/) || html.match(/"(EA[A-Za-z0-9]{20,})"/);
               let dtsg = null;
               if (html.includes('["DTSGInitData",[],{"token":"')) {
                 dtsg = html.split('["DTSGInitData",[],{"token":"')[1]?.split('"')[0];
@@ -542,8 +605,11 @@ function parseTokensFromHtml(html) {
   let lsd = null;
   let userName = null;
 
-  // 1. Access Token EAAB... hoặc EAAI...
-  const tokenMatches = html.match(/"(EA[A-Za-z0-9]{20,})"/g) || html.match(/access_token:"(EA[A-Za-z0-9]+)"/g);
+  // 1. Access Token. Ưu tiên nguồn rõ ràng (window.__accessToken của Ads Manager); regex "EA..." chung chung chỉ là dự phòng
+  //    cho Ads Check (có thể bắt nhầm token của module khác nên Super Share Graph luôn xác minh chủ token bằng /me).
+  const strictToken = globalThis.AmitTokenProvider ? globalThis.AmitTokenProvider.extractAccessToken(html) : null;
+  const tokenMatches = strictToken ? null : html.match(/"(EA[A-Za-z0-9]{20,})"/g) || html.match(/access_token:"(EA[A-Za-z0-9]+)"/g);
+  if (strictToken) accessToken = strictToken;
   if (tokenMatches && tokenMatches.length) {
     for (const m of tokenMatches) {
       const clean = m.replace(/["\s]|access_token:/g, "");

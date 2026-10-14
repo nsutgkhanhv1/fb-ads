@@ -159,7 +159,7 @@ const AmitApp = {
     }, 2200);
   },
 
-  openModal(title, contentHtml, onConfirm = null) {
+  openModal(title, contentHtml, onConfirm = null, confirmLabel = "Xác nhận") {
     this.log("info", "modal", { title, confirm: !!onConfirm });
     const modalBg = document.getElementById("modalBg");
     const modalTitle = document.getElementById("modalTitle");
@@ -171,6 +171,7 @@ const AmitApp = {
 
     if (modalConfirmBtn) {
       modalConfirmBtn.style.display = onConfirm ? "inline-block" : "none";
+      modalConfirmBtn.textContent = confirmLabel;
       modalConfirmBtn.onclick = () => {
         this.closeModal();
         if (onConfirm) onConfirm();

@@ -187,6 +187,7 @@ const AmitBridge = {
 
       // Thao tác ghi lên Facebook tuyệt đối không được giả lập thành công.
       case "execute_super_share_batch":
+      case "super_share_preview":
       case "get_execution_status":
         return { success: false, error: "EXTENSION_UNAVAILABLE" };
 

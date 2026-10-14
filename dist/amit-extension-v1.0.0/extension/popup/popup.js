@@ -131,6 +131,22 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   loadJev();
 
+  // Engine Super Share (feature flag super_share_engine)
+  const engineEl = document.getElementById("engineSelect");
+  const engineMsgEl = document.getElementById("engineMsg");
+  chrome.runtime.sendMessage({ action: "get_super_share_engine" }, res => {
+    if (res && res.ok) engineEl.value = res.engine;
+  });
+  engineEl.addEventListener("change", () => {
+    chrome.runtime.sendMessage({ action: "set_super_share_engine", engine: engineEl.value }, res => {
+      plog(res && res.ok ? "info" : "warn", "engine.set", { engine: engineEl.value, ok: !!(res && res.ok) });
+      engineMsgEl.style.color = res && res.ok ? "#00875a" : "#e53935";
+      engineMsgEl.textContent = res && res.ok
+        ? `Đã chuyển sang engine ${res.engine.toUpperCase()}. Áp dụng cho batch tạo từ bây giờ.`
+        : "Không đổi được engine.";
+    });
+  });
+
   // Tự động kiểm tra ngay khi mở popup
   checkSession();
 
