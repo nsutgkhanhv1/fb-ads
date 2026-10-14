@@ -75,6 +75,96 @@ const okFetch = (content, status) => async (url, opts) => {
   const t2 = await J.jevTest(okFetch('{"index": 0, "confidence": 0.99}'));
   ok("jevTest: đáp án đúng -> passed; đáp án sai -> passed=false", t1.ok && t1.passed === true && t2.ok && t2.passed === false, { t1, t2 });
 
+  // =========================================================
+  // JEV = model "decisions": POST /api/alpha/decisions (không dùng chat/completions)
+  // =========================================================
+  const DEC_URL = "https://openrouter.ai/api/alpha/decisions";
+  const decFetch = (answer, status) => async (url, opts) => {
+    decFetch.calls.push({ url, opts, body: JSON.parse(opts.body) });
+    return { ok: (status || 200) < 400, status: status || 200, json: async () => ({ id: "gen-dec-1", model: "typesafe/jev-1.13-20260917", provider: "TypeSafe", answers: { control: answer }, usage: { input_tokens: 10, output_tokens: 2 } }) };
+  };
+  decFetch.calls = [];
+  const errFetch = (status, message) => async () => ({ ok: false, status, json: async () => ({ error: { code: status, message } }) });
+
+  // --- chọn endpoint theo tên model ---
+  ok("isDecisionsModel: jev-latest, ~typesafe/jev-latest, typesafe/jev-1.13[-ngày] là decisions",
+    ["jev-latest", "~typesafe/jev-latest", "typesafe/jev-latest", "typesafe/jev-1.13", "typesafe/jev-1.13-20260917"].every(J.isDecisionsModel));
+  ok("isDecisionsModel: model chat (gpt-4o-mini, claude, typesafe/jev-router) KHÔNG phải decisions",
+    !["openai/gpt-4o-mini", "anthropic/claude-x", "typesafe/jev-router", "", undefined, "my-jev-latest-clone/foo"].some(J.isDecisionsModel));
+  ok("mặc định cho cài đặt mới là model Jev (decisions)", J.isDecisionsModel(J.JEV_DEFAULTS.model), J.JEV_DEFAULTS.model);
+
+  // --- dựng request ---
+  const dreq = J.buildDecisionsRequest({ step: "ADD_PEOPLE", goal: "Locate Add people", candidates: [
+    { index: 0, tag: "button", role: null, label: "Hủy" },
+    { index: 1, tag: "button", role: "menuitem", label: "Thêm người 100058927816176 a@b.com", html: "<script>secret</script>", token: "EAAB123" }
+  ] }, "~typesafe/jev-latest", 40);
+  const q = dreq.questions.control;
+  ok("decisions body: model, state{step,goal}, MỘT câu hỏi kiểu choice", dreq.model === "~typesafe/jev-latest" && dreq.state.goal === "Locate Add people" && dreq.state.step === "ADD_PEOPLE" && Object.keys(dreq.questions).join() === "control" && q.type === "choice" && typeof q.instructions === "string", dreq);
+  ok("decisions body: mỗi candidate là lựa chọn c<index> + 'none'; nhãn đã che số dài/email; không HTML/token", Object.keys(q.criteria).join() === "c0,c1,none" && q.criteria.c1.includes("role: menuitem") && q.criteria.c1.includes("Thêm người # <email>") && !JSON.stringify(dreq).match(/secret|EAAB|100058927816176|a@b\.com/), q.criteria);
+  ok("decisions body: có luật cấm chọn Hủy/Đóng và cấm quyết định nghiệp vụ; không có messages/temperature", /cancel, close/i.test(q.instructions) && /only locate controls/i.test(q.instructions) && !("messages" in dreq) && !("temperature" in dreq));
+
+  // --- parse ---
+  const pc = (a, n) => J.parseDecisionsResponse({ answers: { control: a } }, n == null ? 3 : n);
+  ok("decisions parse: choice c1 + confidence", JSON.stringify(pc({ type: "choice", choice: "c1", confidence: 0.93, probabilities: { c1: 0.9 } })) === '{"index":1,"confidence":0.93}');
+  ok("decisions parse: 'none' = Jev không chọn (index null)", pc({ type: "choice", choice: "none", confidence: 0.7 }).index === null);
+  ok("decisions parse: thiếu confidence thì dùng xác suất của lựa chọn; thiếu cả hai -> bỏ (không bịa)", pc({ type: "choice", choice: "c2", probabilities: { c2: 0.88 } }).confidence === 0.88 && pc({ type: "choice", choice: "c2" }) === null);
+  ok("decisions parse: confidence được kẹp về 0..1", pc({ type: "choice", choice: "c0", confidence: 4 }).confidence === 1);
+  ok("decisions parse: choice lạ / ngoài phạm vi / sai kiểu / thiếu answers -> bỏ",
+    pc({ type: "choice", choice: "c9", confidence: 1 }) === null && pc({ type: "choice", choice: "x1", confidence: 1 }) === null && pc({ type: "choice", choice: "c-1", confidence: 1 }) === null
+    && pc({ type: "score", score: 1, confidence: 1 }) === null && pc({ type: "noul", noul: 0.9 }) === null && J.parseDecisionsResponse({}, 3) === null && J.parseDecisionsResponse(null, 3) === null);
+
+  // --- gọi thật (fetch giả) ---
+  await J.saveJevConfig({ enabled: true, apiKey: KEY, model: "jev-latest" });
+  decFetch.calls.length = 0;
+  const dr = await J.jevResolve({ step: "ADD_PEOPLE", goal: "Locate Add people", candidates: cands }, decFetch({ type: "choice", choice: "c1", confidence: 0.95, probabilities: { c0: 0.02, c1: 0.95, none: 0.03 } }));
+  const dc = decFetch.calls[0];
+  ok("decisions resolve: model jev-latest -> POST /api/alpha/decisions, KHÔNG chat/completions", dr.ok && dc && dc.url === DEC_URL && decFetch.calls.length === 1 && dr.mode === "decisions", { url: dc && dc.url, dr });
+  ok("decisions resolve: trả index + confidence; model thực tế lấy từ phản hồi", dr.index === 1 && dr.confidence === 0.95 && dr.model === "typesafe/jev-1.13-20260917", dr);
+  ok("decisions resolve: Bearer key, JSON, body gửi đúng model đã cấu hình; kết quả không chứa key", dc.opts.headers.Authorization === `Bearer ${KEY}` && dc.opts.headers["Content-Type"] === "application/json" && dc.body.model === "jev-latest" && dc.opts.method === "POST" && !JSON.stringify(dr).includes("SECRETKEY"));
+  const dn = await J.jevResolve({ goal: "g", candidates: cands }, decFetch({ type: "choice", choice: "none", confidence: 0.8 }));
+  ok("decisions resolve: 'none' -> ok, index null (executor sẽ coi là không tìm thấy)", dn.ok && dn.index === null && dn.confidence === 0.8, dn);
+  ok("decisions resolve: phản hồi sai hình dạng -> BAD_RESPONSE", (await J.jevResolve({ goal: "g", candidates: cands }, decFetch({ type: "choice", choice: "c7", confidence: 1 }))).reason === "BAD_RESPONSE");
+  ok("decisions resolve: lỗi mạng -> NETWORK_ERROR, không ném", (await J.jevResolve({ goal: "g", candidates: cands }, async () => { throw new Error("boom"); })).reason === "NETWORK_ERROR");
+  ok("decisions resolve: quá nhiều candidate vẫn bị từ chối trước khi gọi mạng", (await J.jevResolve({ goal: "g", candidates: Array.from({ length: 41 }, (_, i) => ({ index: i, tag: "a", label: "x" })) }, async () => { throw new Error("không được gọi"); })).reason === "TOO_MANY_CANDIDATES");
+
+  // --- lý do lỗi thật được hiển thị ---
+  const e400 = await J.jevResolve({ goal: "g", candidates: cands }, errFetch(400, "Invalid request parameters: questions.control.criteria"));
+  ok("lỗi 400: hiện lý do thật từ OpenRouter (không chỉ 'lỗi 400')", e400.reason === "HTTP_400" && e400.message.includes("Invalid request parameters"), e400);
+  ok("lỗi 401 / 402 có thông báo riêng", (await J.jevResolve({ goal: "g", candidates: cands }, errFetch(401, "x"))).message === "API key không hợp lệ." && (await J.jevResolve({ goal: "g", candidates: cands }, errFetch(402, "x"))).message.includes("hết credit"));
+  const longMsg = await J.jevResolve({ goal: "g", candidates: cands }, errFetch(500, "x".repeat(900)));
+  ok("lỗi: thông báo được cắt gọn (<= 200 ký tự lý do)", longMsg.message.length < 260, longMsg.message.length);
+  ok("lỗi: body lỗi không phải JSON vẫn ra thông báo, không ném", (await J.jevResolve({ goal: "g", candidates: cands }, async () => ({ ok: false, status: 502, json: async () => { throw new Error("html"); } }))).message === "OpenRouter trả lỗi 502.");
+
+  // --- tự chuyển endpoint khi OpenRouter báo 'decisions model' ---
+  await J.saveJevConfig({ model: "acme/futuristic-1" }); // tên không khớp mẫu nhưng thực ra là model decisions
+  const seen = [];
+  const switching = async (url, opts) => {
+    seen.push(url);
+    if (url === J.OPENROUTER_URL) return { ok: false, status: 400, json: async () => ({ error: { message: "acme/futuristic-1 is a decisions model and cannot be used with the chat/completions endpoint. Use the /api/alpha/decisions endpoint instead." } }) };
+    return { ok: true, status: 200, json: async () => ({ model: "acme/futuristic-1", answers: { control: { type: "choice", choice: "c0", confidence: 0.9 } }, usage: { input_tokens: 1, output_tokens: 1 } }) };
+  };
+  const sw1 = await J.jevResolve({ goal: "g", candidates: cands }, switching);
+  ok("tự chuyển: chat báo 'is a decisions model' -> gọi lại bằng /api/alpha/decisions và thành công", sw1.ok && sw1.index === 0 && sw1.mode === "decisions" && seen.join() === `${J.OPENROUTER_URL},${DEC_URL}`, { sw1, seen });
+  seen.length = 0;
+  const sw2 = await J.jevResolve({ goal: "g", candidates: cands }, switching);
+  ok("tự chuyển: lần sau đi thẳng decisions (đã nhớ), không gọi chat nữa", sw2.ok && seen.join() === DEC_URL, seen);
+  seen.length = 0;
+  const nl = await J.jevResolve({ goal: "g", candidates: cands }, async url => { seen.push(url); return { ok: false, status: 400, json: async () => ({ error: { message: "model not found" } }) }; });
+  ok("lỗi 400 khác không gây chuyển endpoint, không lặp vô hạn", nl.reason === "HTTP_400" && seen.length === 1);
+  await J.saveJevConfig({ model: "m/y" });
+  seen.length = 0;
+  await J.jevResolve({ goal: "g", candidates: cands }, okFetch('{"index": 1, "confidence": 0.9}'));
+  ok("model chat khác vẫn đi chat/completions như cũ", okFetch.last.url === J.OPENROUTER_URL);
+
+  // --- Kiểm tra kết nối (nút trong popup) với model decisions ---
+  await J.saveJevConfig({ model: "~typesafe/jev-latest" });
+  decFetch.calls.length = 0;
+  const jt = await J.jevTest(decFetch({ type: "choice", choice: "c1", confidence: 0.99 }));
+  ok("jevTest với Jev: gọi decisions, đáp án 'Add people' đúng -> passed", jt.ok && jt.passed === true && decFetch.calls[0].url === DEC_URL && decFetch.calls[0].body.model === "~typesafe/jev-latest", jt);
+  const jt2 = await J.jevTest(decFetch({ type: "choice", choice: "c0", confidence: 0.99 }));
+  ok("jevTest với Jev: đáp án sai -> passed=false", jt2.ok && jt2.passed === false);
+  await J.saveJevConfig({ model: "m/y" });
+
   // --- xóa key ---
   r = await J.saveJevConfig({ clearKey: true, enabled: false });
   ok("xóa key: không còn key trong storage", r.ok && mem[J.JEV_CONFIG_KEY].apiKey === "" && r.config.hasKey === false, r);

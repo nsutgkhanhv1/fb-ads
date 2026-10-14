@@ -488,6 +488,31 @@ async function getFacebookCookie(name) {
   });
 }
 
+const CHECKPOINT_TTL_MS = 6 * 3600 * 1000;
+
+// Facebook chuyển nick bị khóa/yêu cầu xác thực sang các đường dẫn này
+function isCheckpointUrl(url) {
+  try {
+    const p = new URL(url).pathname;
+    return /^\/(checkpoint|security\/twofactor|login\/?$|confirmemail)/.test(p);
+  } catch (_) {
+    return false;
+  }
+}
+
+async function getCheckpointFlag(uid) {
+  const store = await chrome.storage.local.get("amit_checkpoint_uids");
+  const ts = store.amit_checkpoint_uids && store.amit_checkpoint_uids[uid];
+  return ts && Date.now() - ts < CHECKPOINT_TTL_MS ? ts : 0;
+}
+
+async function setCheckpointFlag(uid) {
+  const store = await chrome.storage.local.get("amit_checkpoint_uids");
+  const flags = store.amit_checkpoint_uids || {};
+  flags[uid] = Date.now();
+  await chrome.storage.local.set({ amit_checkpoint_uids: flags });
+}
+
 /**
  * Tự động phân giải session Facebook từ Cookie và HTML nền
  */
@@ -508,6 +533,14 @@ async function resolveFacebookSession(forceRefresh = false) {
     AmitLog.warn("sw.session.no_cookie", { forceRefresh });
     console.log("[AMIT V1] Không tìm thấy cookie c_user. Người dùng chưa đăng nhập Facebook.");
     return null;
+  }
+
+  // Nick đang bị checkpoint/suspend: không quét nền nữa (mỗi request thêm có thể làm Facebook siết nick chặt hơn).
+  // Chỉ bỏ qua khi tự động (alarm, content); người dùng chủ động bấm (forceRefresh) thì vẫn thử lại.
+  const flagged = await getCheckpointFlag(uid);
+  if (flagged && !forceRefresh) {
+    AmitLog.info("sw.session.skipped_checkpoint", { uid, since_s: Math.round((Date.now() - flagged) / 1000) });
+    return { uid, userName: `Via ${uid}`, accessToken: null, fb_dtsg: null, lsd: null, updatedAt: Date.now(), checkpoint: true };
   }
 
   AmitLog.info("sw.session.resolving", { uid, forceRefresh });
@@ -534,6 +567,12 @@ async function resolveFacebookSession(forceRefresh = false) {
   for (const url of targetEndpoints) {
     try {
       const res = await fetch(url, { credentials: "include" });
+      if (isCheckpointUrl(res.url)) {
+        await setCheckpointFlag(uid);
+        AmitLog.warn("sw.session.checkpoint", { uid, url: String(res.url).split("?")[0] });
+        sessionData.checkpoint = true;
+        break;
+      }
       const html = await res.text();
       const parsed = parseTokensFromHtml(html);
 
@@ -563,7 +602,7 @@ async function resolveFacebookSession(forceRefresh = false) {
   }
 
   // 4. Nếu vẫn chưa có accessToken, thử đọc trực tiếp từ tab Facebook đang mở
-  if (!sessionData.accessToken) {
+  if (!sessionData.accessToken && !sessionData.checkpoint) {
     try {
       const tabs = await chrome.tabs.query({ url: "*://*.facebook.com/*" });
       for (const tab of tabs) {

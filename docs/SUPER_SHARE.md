@@ -66,15 +66,21 @@ Cách hoạt động (docx §11):
 
 - Executor làm theo thứ tự *Known DOM → nhãn hiển thị → Jev*. Jev chỉ được hỏi khi hai bước đầu không xác định được control.
 - Các điểm có Jev fallback: tìm mục vai trò (đúng goal của docx §5 Step 5), nút **Thêm người**, control chọn **role** (role vẫn do input quyết định, sau đó vẫn verify), nút **xác nhận**, control **Xóa** trên dòng, control **đổi role** trên dòng.
-- Executor gửi `goal` + danh sách candidate (đã lọc theo scope của bước đó, ví dụ chỉ các control trong **đúng dòng** của UID đó) tới service worker; **service worker** mới gọi `https://openrouter.ai/api/v1/chat/completions` với key. Key không bao giờ ra khỏi service worker (không gửi cho content script hay web, popup chỉ nhận 4 ký tự cuối).
+- Executor gửi `goal` + danh sách candidate (đã lọc theo scope của bước đó, ví dụ chỉ các control trong **đúng dòng** của UID đó) tới service worker; **service worker** mới gọi OpenRouter với key (endpoint xem bên dưới). Key không bao giờ ra khỏi service worker (không gửi cho content script hay web, popup chỉ nhận 4 ký tự cuối).
 - Jev chỉ trả `{index, confidence}`. Code luôn validate: index phải nằm trong danh sách, confidence ≥ 0.8 (thấp hơn → `UI_TARGET_AMBIGUOUS`), **không bao giờ** nhận nút Hủy/Đóng/Quay lại (bị loại khỏi candidate trước khi gửi), tối đa 12 lần gọi mỗi TKQC, và mục vai trò do Jev chọn phải thật sự chứa dòng người dùng / nút Thêm người / nhãn role.
+- **Hai endpoint theo loại model.** Jev (`jev-latest`, `~typesafe/jev-latest`, `typesafe/jev-1.13`...) là model *decisions*: **không** dùng được với `chat/completions` (OpenRouter báo
+  "is a decisions model and cannot be used with the chat/completions endpoint"). Với các model này extension gọi `POST https://openrouter.ai/api/alpha/decisions` với MỘT câu hỏi kiểu `choice`:
+  `state` = {step, goal}; `criteria` = mỗi candidate là một lựa chọn `c<index>` (mô tả = tag, role, nhãn đã che) cộng `none`; `instructions` giữ luật "chỉ định vị control, không chọn Hủy/Đóng".
+  Phản hồi `answers.control` = {choice, confidence, probabilities}: `c<n>` -> index n, `none` -> không chọn, thiếu `confidence` thì dùng xác suất của lựa chọn, thiếu cả hai thì bỏ (không bịa).
+  Model chat thường (vd `openai/gpt-4o-mini`) vẫn đi `chat/completions` như cũ. Endpoint chọn theo tên model; nếu OpenRouter báo "is a decisions model" thì tự chuyển sang decisions rồi nhớ trong phiên service worker.
+  Lý do lỗi thật của OpenRouter (cắt 200 ký tự) được hiện ở thông báo thay vì chỉ "lỗi 400". Endpoint `/api/alpha/decisions` là bản **alpha** của OpenRouter nên hình dạng có thể đổi; schema lấy từ `openrouter.ai/openapi.json`.
 - Jev **không** quyết định TKQC, UID, role, action, ai giữ / ai xóa; những thứ đó đã cố định trong input và trong goal.
 - Mọi lần dùng Jev được ghi vào `result.jev` (bước, nhãn được chọn, confidence) để kiểm tra lại sau.
 - Jev lỗi / tắt / hết thời gian (15 giây) → coi như không có Jev và trả lỗi UI tường minh; không bao giờ đoán.
 
 Dữ liệu gửi tới OpenRouter: goal + nhãn các control (cắt 60 ký tự, dãy số ≥ 6 chữ số và email bị che thành `#` / `<email>`). Không gửi HTML, token, cookie, nội dung form. Lưu ý: nhãn vẫn có thể gồm **tên hiển thị** của người dùng trong dòng vai trò; nếu không muốn gửi, tắt Jev.
 
-Model mặc định `openai/gpt-4o-mini` chỉ là giá trị ban đầu, đổi trong popup sang model bạn muốn dùng (chưa kiểm chứng model nào trên Facebook thật; nút Kiểm tra chỉ thử một câu hỏi cố định).
+Model mặc định `~typesafe/jev-latest` chỉ là giá trị ban đầu, đổi trong popup (chưa kiểm chứng model nào trên Facebook thật; nút Kiểm tra chỉ thử một câu hỏi cố định). Cấu hình đã lưu từ trước (vd `openai/gpt-4o-mini`) được giữ nguyên.
 
 ## Log để user gửi lại cho dev
 
